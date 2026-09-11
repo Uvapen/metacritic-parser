@@ -5,7 +5,7 @@
 из собственного каталога и находит летсплей с заключением по речи автора.
 
 - **Сервис:** _подставьте URL деплоя_
-- **Переписка с нейросетью:** `data/llm_logs.jsonl` (raw) + просмотр в UI: `/monitor` → «Вызовы LLM» → «диалог»
+- **Переписка с нейросетью:** raw JSONL в репозитории — `data/llm_logs.jsonl` (prompt, response, kind, run_id); в UI: `/monitor` → «Вызовы LLM» → «диалог»
 - **Стек:** FastAPI · SQLAlchemy 2 (async) · SQLite/Postgres · Groq (`openai/gpt-oss-120b` + запасная `openai/gpt-oss-20b` + `whisper-large-v3-turbo`) · APScheduler · Jinja2 · `curl_cffi` · YouTube Innertube
 
 ## Соответствие ТЗ

@@ -29,7 +29,7 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 data/*.json
-data/llm_logs.jsonl
+# data/llm_logs.jsonl — в git по ТЗ (переписка с Groq)
 data/tmp/
 *.part
 *.ytdl
