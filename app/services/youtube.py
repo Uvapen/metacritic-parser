@@ -19,7 +19,12 @@ from sqlalchemy import or_, select
 from app.config import Settings, get_settings
 from app.db import SessionLocal
 from app.models import Game
-from app.services.yt_audio import download_letsplay_audio, download_letsplay_captions, prepare_whisper_audio
+from app.services.yt_audio import (
+    download_letsplay_audio,
+    download_letsplay_captions,
+    prepare_whisper_audio,
+    search_youtube_ytdlp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +88,7 @@ _SKIP_HINTS = (
     "soundtrack",
     " ost",
     "music video",
+    "music mix",
     "lyric",
     "audio only",
     "song ",
@@ -314,6 +320,8 @@ def classify_youtube_video(game_title: str, video: YoutubeVideo) -> str | None:
         return None
     if review:
         return "review"
+    if video.duration_sec is not None and video.duration_sec >= 8 * 60:
+        return "letsplay"
     return None
 
 
@@ -437,13 +445,34 @@ class YoutubeClient:
                         continue
                     seen.add(video.video_id)
                     collected.append(video)
+                ranked = rank_letsplay_candidates(game_title, collected)
+                letsplays = [
+                    video
+                    for video in ranked
+                    if classify_youtube_video(game_title, video) == "letsplay"
+                ]
+                if letsplays:
+                    return
 
         await _collect(_play_queries(game_title))
-        return [
+        ranked = rank_letsplay_candidates(game_title, collected)
+        letsplays = [
             video
-            for video in rank_letsplay_candidates(game_title, collected)
+            for video in ranked
             if classify_youtube_video(game_title, video) == "letsplay"
-        ][:LETS_PLAY_PROBE_LIMIT]
+        ]
+        if letsplays:
+            return letsplays[:LETS_PLAY_PROBE_LIMIT]
+        await _collect(_review_queries(game_title))
+        ranked = rank_letsplay_candidates(game_title, collected)
+        if ranked:
+            logger.info(
+                "Летсплей %s: берём ярус обзора (%s)",
+                game_title,
+                ranked[0].title,
+            )
+            return ranked[:LETS_PLAY_PROBE_LIMIT]
+        return []
 
     async def find_letsplay(self, game_title: str) -> LetsPlayHit | None:
         ranked = await self.list_letsplays(game_title)
@@ -484,7 +513,36 @@ class YoutubeClient:
         videos = await self._search_innertube(query)
         if videos:
             return videos
-        return await self._search_html(query)
+        videos = await self._search_html(query)
+        if videos:
+            return videos
+        return await self._search_ytdlp(query)
+
+    async def _search_ytdlp(self, query: str) -> list[YoutubeVideo]:
+        await _pace(self._settings.youtube_call_interval)
+        try:
+            rows = await search_youtube_ytdlp(
+                query,
+                limit=10,
+                timeout=max(20.0, float(self._settings.youtube_timeout or 25.0)),
+            )
+        except Exception as exc:
+            logger.warning("yt-dlp search ошибка %s: %s", query, exc)
+            return []
+        videos = [
+            YoutubeVideo(
+                video_id=str(row["video_id"]),
+                title=str(row["title"]),
+                duration_sec=row.get("duration_sec"),
+                description=row.get("description"),
+                views=row.get("views"),
+                channel=row.get("channel"),
+            )
+            for row in rows
+        ]
+        if videos:
+            logger.info("yt-dlp search %s: %s роликов", query, len(videos))
+        return videos
 
     async def _search_innertube(self, query: str) -> list[YoutubeVideo]:
         session = self._require_session()
@@ -1107,6 +1165,20 @@ async def attach_letsplay(
     if getattr(game, "youtube_summary_source", None) == "none":
         game.youtube_summary = None
         game.youtube_summary_source = None
+
+    async def _trace(message: str) -> None:
+        if llm is None or not hasattr(llm, "note"):
+            return
+        try:
+            await llm.note(
+                prompt=f"[youtube search] {title}",
+                error=message,
+                slug=getattr(game, "slug", None),
+                kind="youtube",
+            )
+        except Exception:
+            logger.exception("Не записали youtube-заметку для %s", getattr(game, "slug", None))
+
     search_failed = False
     try:
         videos = await client.list_letsplays(title)
@@ -1115,6 +1187,11 @@ async def attach_letsplay(
         search_failed = True
         videos = []
     if not videos:
+        await _trace(
+            "Поиск YouTube не вернул летсплей (Innertube/HTML пустые, yt-dlp тоже)"
+            if not search_failed
+            else "Поиск YouTube упал с ошибкой"
+        )
         if search_failed:
             clear_letsplay_attempt(game)
             return True
@@ -1171,6 +1248,7 @@ async def attach_letsplay(
             "Летсплей %s: нет текста из‑за субтитров/Whisper — заглушку не ставим",
             game.slug,
         )
+        await _trace("Ролик найден, но субтитры и Whisper не дали текст")
         clear_letsplay_attempt(game)
         game.youtube_summary = None
         game.youtube_summary_source = None

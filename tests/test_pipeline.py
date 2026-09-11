@@ -223,3 +223,31 @@ def test_job_slugs_from_details_skips_errors_and_dupes():
             {"slug": "", "action": "new"},
         ]
     ) == ["a", "c"]
+
+
+def test_status_from_card_details():
+    from app.services.pipeline import _status_from_card_details
+
+    assert _status_from_card_details([{"action": "new"}], 1) == "success"
+    assert _status_from_card_details([{"action": "error"}], 0) == "error"
+    assert _status_from_card_details(
+        [{"action": "new"}, {"action": "error"}], 1
+    ) == "partial"
+    assert _status_from_card_details(None, 0) == "success"
+
+
+def test_choose_hourly_due_snaps_far_and_overdue():
+    from datetime import datetime, timedelta, timezone
+
+    from app.services.pipeline import choose_hourly_due
+
+    now = datetime(2026, 9, 12, 2, 0, tzinfo=timezone.utc)
+    hour = timedelta(hours=1)
+    assert choose_hourly_due(None, now=now, interval=hour) == now + hour
+    assert choose_hourly_due(now - timedelta(minutes=5), now=now, interval=hour) == now + timedelta(
+        seconds=30
+    )
+    far = now + timedelta(hours=23)
+    assert choose_hourly_due(far, now=now, interval=hour) == now + hour
+    soon = now + timedelta(minutes=40)
+    assert choose_hourly_due(soon, now=now, interval=hour) == soon

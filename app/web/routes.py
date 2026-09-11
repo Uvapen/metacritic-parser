@@ -17,15 +17,19 @@ from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.db import get_db
-from app.models import Game, PlatformScore, RunLog
+from app.models import Game, PipelineJob, PlatformScore, RunLog
 from app.timeutil import to_local
 from app.llm.client import chat_model_chain, groq_chat_retry_in, humanize_llm_error
 from app.scraper.nuxt import normalize_cover_url
 from app.services.pipeline import (
+    JOB_OPEN,
+    JOB_SIMILAR,
+    JOB_YOUTUBE,
     LLM_INFO_KINDS,
     build_status_reason,
     enrichment_is_running,
     enrichment_queue_counts,
+    enrichment_queue_counts_for_run,
     pipeline_is_running,
     run_hourly_pipeline,
     run_similar_now,
@@ -48,6 +52,7 @@ ACTION_RU = {
 }
 STATUS_RU = {
     "running": "идёт",
+    "enriching": "очередь обогащения",
     "success": "успех",
     "partial": "частично",
     "error": "ошибка",
@@ -147,9 +152,13 @@ def action_ru(value: str | None) -> str:
     return ACTION_RU.get(value, value)
 
 
-def status_ru(value: str | None) -> str:
+def status_ru(value: str | None, run_id: Any = None) -> str:
     if not value:
         return "—"
+    if value == "enriching" and run_id:
+        return f"очередь обогащения прогона №{run_id}"
+    if value == "running" and run_id:
+        return f"идёт прогон №{run_id}"
     return STATUS_RU.get(value, value)
 
 
@@ -1013,6 +1022,20 @@ async def game_page(slug: str, request: Request, db: DbSession) -> HTMLResponse:
     )
     if game is None:
         raise HTTPException(status_code=404, detail="Игра не найдена")
+    pending_kinds = set(
+        (
+            await db.execute(
+                select(PipelineJob.kind).where(
+                    PipelineJob.slug == slug,
+                    PipelineJob.status.in_(JOB_OPEN),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    awaiting_similar = JOB_SIMILAR in pending_kinds
+    awaiting_youtube = JOB_YOUTUBE in pending_kinds
     critic_reviews = [item for item in game.reviews if item.source == "critic"]
     user_reviews = [item for item in game.reviews if item.source == "user"]
     critic_summary = None
@@ -1032,6 +1055,9 @@ async def game_page(slug: str, request: Request, db: DbSession) -> HTMLResponse:
             "critic_summary": critic_summary,
             "user_summary": user_summary,
             "similar_games": await similar_payload(db, game),
+            "awaiting_similar": awaiting_similar,
+            "awaiting_youtube": awaiting_youtube,
+            "awaiting_enrichment": awaiting_similar or awaiting_youtube,
         },
     )
 
@@ -1076,6 +1102,11 @@ async def monitor_page(
     start = (page - 1) * runs_per_page
     runs = filtered_runs[start : start + runs_per_page]
     last_run = await db.scalar(select(RunLog).order_by(RunLog.started_at.desc()).limit(1))
+    last_run_queue = (
+        await enrichment_queue_counts_for_run(int(last_run.id))
+        if last_run is not None
+        else {"similar": 0, "youtube": 0}
+    )
     games_count = int(await db.scalar(select(func.count()).select_from(Game)) or 0)
     last_counts = _action_counts(last_run.details if last_run else None)
     last_llm_errors = _llm_errors_of(last_run) if last_run else 0
@@ -1146,6 +1177,8 @@ async def monitor_page(
             "llm_calls": _llm_log_count(),
             "games_count": games_count,
             "last_run": last_run,
+            "last_run_queue_similar": last_run_queue.get("similar", 0),
+            "last_run_queue_youtube": last_run_queue.get("youtube", 0),
             "last_counts": last_counts,
             "last_llm_errors": last_llm_errors,
             "next_run_at": _next_run_at_iso(),
@@ -1211,6 +1244,7 @@ async def run_detail_page(run_id: int, request: Request, db: DbSession) -> HTMLR
         )
         rows.append(row)
     calls, _retries, fails = _llm_jsonl_stats_for_run(run.id, all_runs)
+    run_queue = await enrichment_queue_counts_for_run(run.id)
     return templates.TemplateResponse(
         request,
         "run_detail.html",
@@ -1220,6 +1254,8 @@ async def run_detail_page(run_id: int, request: Request, db: DbSession) -> HTMLR
             "counts": _action_counts(details),
             "llm_errors": fails or _llm_errors_of(run),
             "llm_calls": calls or _llm_calls_of(details),
+            "queue_similar": run_queue.get("similar", 0),
+            "queue_youtube": run_queue.get("youtube", 0),
         },
     )
 

@@ -467,4 +467,44 @@ def test_attach_does_not_stub_when_whisper_fails():
     assert game.youtube_url is None
 
 
+def test_long_title_match_without_gameplay_word_is_letsplay():
+    from app.services.youtube import YoutubeVideo, classify_youtube_video, choose_letsplay
+
+    video = YoutubeVideo(
+        video_id="valheimnight",
+        title="Valheim — First Night in the Tenth World",
+        duration_sec=22 * 60,
+        views=50_000,
+    )
+    assert classify_youtube_video("Valheim", video) == "letsplay"
+    assert choose_letsplay("Valheim", [video]) is video
+
+
+def test_parse_ytdlp_search_json_reads_entries():
+    import json
+
+    from app.services.yt_audio import parse_ytdlp_search_json
+
+    payload = json.dumps(
+        {
+            "entries": [
+                {
+                    "id": "abcdefghijk",
+                    "title": "Valheim Gameplay",
+                    "duration": 1800,
+                    "view_count": 12345,
+                    "channel": "PlayChan",
+                },
+                {"id": "short", "title": "skip"},
+            ]
+        }
+    )
+    rows = parse_ytdlp_search_json(payload)
+    assert len(rows) == 1
+    assert rows[0]["video_id"] == "abcdefghijk"
+    assert rows[0]["views"] == 12345
+    assert rows[0]["channel"] == "PlayChan"
+
+
+
 

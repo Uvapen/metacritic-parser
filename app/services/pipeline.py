@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -43,12 +43,14 @@ from app.services.youtube import needs_letsplay_job, process_letsplay_slug
 logger = logging.getLogger(__name__)
 
 _running = False
+_active_card_run_id: int | None = None
 _run_lock = asyncio.Lock()
 _enriching = False
 _enrich_lock = asyncio.Lock()
 JOB_SIMILAR = "similar"
 JOB_YOUTUBE = "youtube"
 JOB_OPEN = ("pending", "running")
+RUN_IN_FLIGHT = ("running", "enriching")
 
 BATCH_SIZE = 20
 BROWSE_PAGE_LIMIT = 20
@@ -103,6 +105,19 @@ async def _write_run(
         return run
 
 
+def _status_from_card_details(details: Any, games_processed: int) -> str:
+    """Итог прогона по карточкам: очередь похожих/летсплеев на статус не влияет."""
+    items = details if isinstance(details, list) else []
+    game_errors = sum(
+        1 for item in items if isinstance(item, dict) and item.get("action") == "error"
+    )
+    if game_errors and games_processed:
+        return "partial"
+    if game_errors:
+        return "error"
+    return "success"
+
+
 async def _finish_run(
     run_id: int,
     *,
@@ -112,14 +127,19 @@ async def _finish_run(
     error_message: str | None = None,
     details: list[dict[str, Any]] | None = None,
     llm_errors: int = 0,
+    complete: bool = True,
 ) -> RunLog:
     async with SessionLocal() as session:
         run = await session.get(RunLog, run_id)
         if run is None:
             run = RunLog(status=status)
             session.add(run)
-        run.status = status
-        run.finished_at = now_utc()
+        if complete:
+            run.status = status
+            run.finished_at = now_utc()
+        else:
+            run.status = status
+            run.finished_at = None
         run.games_found = games_found
         run.games_processed = games_processed
         run.error_message = error_message
@@ -127,6 +147,36 @@ async def _finish_run(
         run.llm_errors = llm_errors
         await session.commit()
         await session.refresh(run)
+        return run
+
+
+async def _finalize_run_if_idle(run_id: int) -> RunLog | None:
+    """Закрывает прогон только когда пуста очередь похожих/летсплеев именно этого run_id."""
+    rid = int(run_id or 0)
+    if not rid:
+        return None
+    if _active_card_run_id == rid:
+        return None
+    async with SessionLocal() as session:
+        run = await session.get(RunLog, rid)
+        if run is None or run.status not in RUN_IN_FLIGHT:
+            return None
+        open_n = await session.scalar(
+            select(func.count())
+            .select_from(PipelineJob)
+            .where(
+                PipelineJob.run_id == rid,
+                PipelineJob.status.in_(JOB_OPEN),
+            )
+        )
+        if int(open_n or 0):
+            return None
+        status = _status_from_card_details(run.details, int(run.games_processed or 0))
+        run.status = status
+        run.finished_at = now_utc()
+        await session.commit()
+        await session.refresh(run)
+        logger.info("Прогон #%s закрыт: %s (очередь этого прогона пуста)", rid, status)
         return run
 
 
@@ -158,6 +208,72 @@ async def _save_pipeline_state(today: date, *, source: str, offset: int) -> None
         state.used_main = source != "main"
         state.offset = offset
         await session.commit()
+
+
+def _aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+async def load_hourly_due_at() -> datetime | None:
+    """Когда должен сработать следующий hourly. Ручной запуск это не двигает."""
+    async with SessionLocal() as session:
+        state = await session.get(PipelineState, 1)
+        if state is None:
+            return None
+        return _aware_utc(state.hourly_due_at)
+
+
+async def save_hourly_due_at(when: datetime) -> None:
+    due = _aware_utc(when)
+    async with SessionLocal() as session:
+        state = await session.get(PipelineState, 1)
+        if state is None:
+            state = PipelineState(
+                id=1,
+                day=today_local(),
+                offset=0,
+                used_main=False,
+                source="main",
+            )
+            session.add(state)
+        state.hourly_due_at = due
+        await session.commit()
+
+
+def choose_hourly_due(
+    stored: datetime | None, *, now: datetime, interval: timedelta
+) -> datetime:
+    """Какой слот hourly поставить: сохранённый, просроченный или слишком далёкий."""
+    if stored is None:
+        return now + interval
+    if stored <= now:
+        return now + timedelta(seconds=30)
+    if stored - now > interval * 2:
+        return now + interval
+    return stored
+
+
+async def next_hourly_due_at(*, interval_hours: int, now: datetime | None = None) -> datetime:
+    """Следующий hourly: сохранённый слот или now+интервал. Просроченный — скоро."""
+    hours = max(1, int(interval_hours or 1))
+    interval = timedelta(hours=hours)
+    now = _aware_utc(now) or now_utc()
+    stored = await load_hourly_due_at()
+    due = choose_hourly_due(stored, now=now, interval=interval)
+    await save_hourly_due_at(due)
+    return due
+
+
+async def bump_hourly_due_at(*, interval_hours: int) -> datetime:
+    """Сдвиг слота после срабатывания планировщика. Ручной POST сюда не ходит."""
+    hours = max(1, int(interval_hours or 1))
+    due = now_utc() + timedelta(hours=hours)
+    await save_hourly_due_at(due)
+    return due
 
 
 async def _game_index(session: AsyncSession) -> dict[str, Game]:
@@ -1100,19 +1216,28 @@ async def last_run_slugs() -> tuple[int, list[str]]:
         return int(last_run.id), _job_slugs_from_details(last_run.details)
 
 
-async def enrichment_queue_counts() -> dict[str, int]:
+async def enrichment_queue_counts(*, run_id: int | None = None) -> dict[str, int]:
     """Сколько задач similar/youtube ждут или уже в работе."""
     counts = {JOB_SIMILAR: 0, JOB_YOUTUBE: 0}
     async with SessionLocal() as session:
-        rows = await session.execute(
+        stmt = (
             select(PipelineJob.kind, func.count())
             .where(PipelineJob.status.in_(JOB_OPEN))
             .group_by(PipelineJob.kind)
         )
+        rid = int(run_id or 0)
+        if rid:
+            stmt = stmt.where(PipelineJob.run_id == rid)
+        rows = await session.execute(stmt)
         for kind, total in rows.all():
             if kind in counts:
                 counts[kind] = int(total or 0)
     return counts
+
+
+async def enrichment_queue_counts_for_run(run_id: int) -> dict[str, int]:
+    """Очередь похожих/летсплеев одного прогона."""
+    return await enrichment_queue_counts(run_id=run_id)
 
 
 async def enqueue_enrichment(
@@ -1200,23 +1325,54 @@ async def _youtube_hole_slugs(limit: int, *, include_stubs: bool = False) -> lis
 
 
 async def recover_enrichment_on_startup() -> None:
-    """После рестарта: зависшие running → pending, старый followup_slugs → очередь."""
+    """После рестарта: зависшие running → pending. Прогон с живой очередью не убиваем."""
     leftover: list[str] = []
     run_id = 0
+    n_stuck = 0
+    n_runs = 0
+    n_kept = 0
+    n_reopened = 0
     async with SessionLocal() as session:
         stuck = await session.execute(select(PipelineJob).where(PipelineJob.status == "running"))
-        n_stuck = 0
         for job in stuck.scalars().all():
             job.status = "pending"
             n_stuck += 1
-        hung = await session.execute(select(RunLog).where(RunLog.status == "running"))
-        n_runs = 0
+        hung = await session.execute(select(RunLog).where(RunLog.status.in_(RUN_IN_FLIGHT)))
         for run in hung.scalars().all():
+            open_n = await session.scalar(
+                select(func.count())
+                .select_from(PipelineJob)
+                .where(
+                    PipelineJob.run_id == run.id,
+                    PipelineJob.status.in_(JOB_OPEN),
+                )
+            )
+            has_details = isinstance(run.details, list) and bool(run.details)
+            if int(open_n or 0) or has_details:
+                if run.status == "running" and has_details:
+                    run.status = "enriching"
+                n_kept += 1
+                continue
             run.status = "error"
             run.finished_at = now_utc()
             if not run.error_message:
                 run.error_message = "Прогон оборвался при рестарте процесса"
             n_runs += 1
+        open_run_ids = await session.execute(
+            select(PipelineJob.run_id)
+            .where(
+                PipelineJob.status.in_(JOB_OPEN),
+                PipelineJob.run_id.is_not(None),
+            )
+            .distinct()
+        )
+        for (rid,) in open_run_ids.all():
+            owned = await session.get(RunLog, int(rid))
+            if owned is None or owned.status not in {"success", "partial"}:
+                continue
+            owned.status = "enriching"
+            owned.finished_at = None
+            n_reopened += 1
         state = await session.get(PipelineState, 1)
         if state and isinstance(state.followup_slugs, list):
             leftover = [str(item) for item in state.followup_slugs if item]
@@ -1227,13 +1383,39 @@ async def recover_enrichment_on_startup() -> None:
         await session.commit()
     if n_stuck:
         logger.info("Вернули в очередь %s зависших задач", n_stuck)
+    if n_reopened:
+        logger.info("Вернули в работу %s прогонов: очередь этого прогона ещё не пуста", n_reopened)
+    if n_kept:
+        logger.info("Оставили %s прогонов в работе: очередь похожих/летсплеев ещё жива", n_kept)
     if n_runs:
         logger.info("Закрыли %s оборванных прогонов после рестарта", n_runs)
     if leftover:
         await enqueue_enrichment(run_id, leftover)
     holes = await _youtube_hole_slugs(get_settings().youtube_backfill_limit)
     if holes:
-        await enqueue_enrichment(run_id, holes, kinds=(JOB_YOUTUBE,))
+        attach_id = int(run_id or 0)
+        run_slugs: set[str] = set()
+        attach_running = False
+        if not attach_id:
+            attach_id, slug_list = await last_run_slugs()
+            run_slugs = set(slug_list)
+        if attach_id:
+            async with SessionLocal() as session:
+                target = await session.get(RunLog, attach_id)
+                if target is not None:
+                    attach_running = target.status in RUN_IN_FLIGHT
+                    if not run_slugs:
+                        run_slugs = set(_job_slugs_from_details(target.details))
+        if attach_running:
+            holes = [slug for slug in holes if slug in run_slugs]
+        if holes:
+            await enqueue_enrichment(attach_id, holes, kinds=(JOB_YOUTUBE,))
+    hung_ids: list[int] = []
+    async with SessionLocal() as session:
+        hung = await session.execute(select(RunLog).where(RunLog.status.in_(RUN_IN_FLIGHT)))
+        hung_ids = [int(run.id) for run in hung.scalars().all()]
+    for rid in hung_ids:
+        await _finalize_run_if_idle(rid)
     pending = await enrichment_queue_counts()
     logger.info(
         "Очередь обогащения: похожие %s, летсплеи %s",
@@ -1310,9 +1492,11 @@ async def _execute_job(job: dict[str, Any]) -> None:
         else:
             raise ValueError(f"unknown job kind {kind}")
         await _finish_job(int(job["id"]), status="done")
+        await _finalize_run_if_idle(run_id)
     except Exception as exc:
         logger.exception("Задача %s %s упала", kind, slug)
         await _finish_job(int(job["id"]), status="error", error=str(exc)[:500])
+        await _finalize_run_if_idle(run_id)
 
 
 async def drain_one_job(*, kind: str | None = None) -> bool:
@@ -1352,7 +1536,9 @@ async def run_similar_now() -> int | None:
     run_id, slugs = await last_run_slugs()
     logger.info("Ручной этап похожих run=%s, игр %s", run_id, len(slugs))
     await enqueue_enrichment(run_id, slugs, kinds=(JOB_SIMILAR,))
-    return await drain_kind(JOB_SIMILAR)
+    done = await drain_kind(JOB_SIMILAR)
+    await _finalize_run_if_idle(run_id)
+    return done
 
 
 async def run_youtube_now() -> int | None:
@@ -1360,10 +1546,17 @@ async def run_youtube_now() -> int | None:
     settings = get_settings()
     run_id, slugs = await last_run_slugs()
     holes = await _youtube_hole_slugs(settings.youtube_backfill_limit, include_stubs=True)
-    merged = list(dict.fromkeys([*slugs, *holes]))
+    attach_running = False
+    if run_id:
+        async with SessionLocal() as session:
+            target = await session.get(RunLog, run_id)
+            attach_running = target is not None and target.status in RUN_IN_FLIGHT
+    merged = list(dict.fromkeys(slugs if attach_running else [*slugs, *holes]))
     logger.info("Ручной этап YouTube run=%s, игр %s", run_id, len(merged))
     await enqueue_enrichment(run_id, merged, kinds=(JOB_YOUTUBE,), force_youtube=True)
-    return await drain_kind(JOB_YOUTUBE)
+    done = await drain_kind(JOB_YOUTUBE)
+    await _finalize_run_if_idle(run_id)
+    return done
 
 
 async def run_hourly_pipeline(
@@ -1379,7 +1572,7 @@ async def run_hourly_pipeline(
     (первый прогон — карусель, следующие — SEE ALL). Уже обработанные сегодня
     игры в выборку не попадают, чтобы добирались новые.
     """
-    global _running
+    global _running, _active_card_run_id
     settings = settings or get_settings()
 
     async with _run_lock:
@@ -1394,6 +1587,7 @@ async def run_hourly_pipeline(
 
     await init_db()
     run = await _write_run(status="running")
+    _active_card_run_id = run.id
     games_found = 0
     games_processed = 0
     llm_errors = 0
@@ -1504,20 +1698,20 @@ async def run_hourly_pipeline(
         await _save_pipeline_state(today, source=source, offset=new_offset)
 
         llm_errors = sum(_detail_llm_errors(item) for item in details)
-        game_errors = sum(1 for item in details if item.get("action") == "error")
-        if game_errors and games_processed:
-            run_status = "partial"
-        elif game_errors:
-            run_status = "error"
-        else:
-            run_status = "success"
         result = await _finish_run(
             run.id,
-            status=run_status,
+            status="enriching",
             games_found=games_found,
             games_processed=games_processed,
             details=details,
             llm_errors=llm_errors,
+            complete=False,
+        )
+        logger.info(
+            "Карточки прогона #%s в базе (%s из %s). Ждём очередь похожих/летсплеев этого прогона.",
+            run.id,
+            games_processed,
+            games_found,
         )
     except Exception as exc:
         logger.exception("Пайплайн завершился с ошибкой")
@@ -1533,6 +1727,12 @@ async def run_hourly_pipeline(
         )
     finally:
         _running = False
+        _active_card_run_id = None
+
+    if result is not None and result.status in RUN_IN_FLIGHT:
+        closed = await _finalize_run_if_idle(run.id)
+        if closed is not None:
+            result = closed
 
     return result if result is not None else run
 

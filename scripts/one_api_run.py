@@ -60,7 +60,7 @@ def wait_finished(prev_id: int) -> dict:
             f"processed={(last or {}).get('games_processed')}",
             flush=True,
         )
-        if run_id > prev_id and status and status != "running" and not running:
+        if run_id > prev_id and status and status not in {"running", "enriching"} and not running:
             return last or {}
         time.sleep(8)
 

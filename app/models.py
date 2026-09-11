@@ -213,6 +213,7 @@ class PipelineState(Base):
     youtube_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     similar_done: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     youtube_done: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    hourly_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

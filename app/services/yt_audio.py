@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import subprocess
 import sys
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,99 @@ def _run_ytdlp_sync(cmd: list[str], timeout: float) -> tuple[int, str]:
 
 async def _run_ytdlp(cmd: list[str], timeout: float) -> tuple[int, str]:
     return await asyncio.to_thread(_run_ytdlp_sync, cmd, timeout)
+
+
+def _run_ytdlp_stdout_sync(cmd: list[str], timeout: float) -> tuple[int, str, str]:
+    kwargs: dict = {"capture_output": True, "timeout": timeout}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run(cmd, **kwargs)
+    except subprocess.TimeoutExpired:
+        return 124, "", "yt-dlp timeout"
+    stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+    return int(proc.returncode or 0), stdout, stderr
+
+
+def parse_ytdlp_search_json(raw: str) -> list[dict[str, Any]]:
+    """Разбор `yt-dlp -J ytsearchN:...` в список роликов."""
+    blob = (raw or "").strip()
+    start = blob.find("{")
+    if start < 0:
+        return []
+    try:
+        data = json.loads(blob[start:])
+    except json.JSONDecodeError:
+        return []
+    entries: list[Any]
+    if isinstance(data, dict) and isinstance(data.get("entries"), list):
+        entries = data["entries"]
+    elif isinstance(data, dict) and data.get("id"):
+        entries = [data]
+    else:
+        return []
+    videos: list[dict[str, Any]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        video_id = str(item.get("id") or "").strip()
+        title = str(item.get("title") or "").strip()
+        if len(video_id) != 11 or not title:
+            continue
+        duration = item.get("duration")
+        try:
+            duration_sec = int(float(duration)) if duration is not None else None
+        except (TypeError, ValueError):
+            duration_sec = None
+        views = item.get("view_count")
+        try:
+            views_i = int(views) if views is not None else None
+        except (TypeError, ValueError):
+            views_i = None
+        channel = str(item.get("channel") or item.get("uploader") or "").strip() or None
+        desc = str(item.get("description") or "").strip() or None
+        videos.append(
+            {
+                "video_id": video_id,
+                "title": title,
+                "duration_sec": duration_sec,
+                "views": views_i,
+                "channel": channel,
+                "description": desc,
+            }
+        )
+    return videos
+
+
+async def search_youtube_ytdlp(
+    query: str,
+    *,
+    limit: int = 10,
+    timeout: float = 45.0,
+) -> list[dict[str, Any]]:
+    """Поиск через yt-dlp: на Render Innertube/HTML часто пустые."""
+    q = " ".join((query or "").split())
+    if not q:
+        return []
+    n = max(1, min(int(limit or 10), 15))
+    cmd = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--flat-playlist",
+        "--no-warnings",
+        "--no-progress",
+        "--skip-download",
+        "-J",
+        f"ytsearch{n}:{q}",
+    ]
+    code, stdout, stderr = await asyncio.to_thread(_run_ytdlp_stdout_sync, cmd, timeout)
+    videos = parse_ytdlp_search_json(stdout)
+    if videos:
+        return videos
+    logger.warning("yt-dlp search %s для %s: %s", code, q, (stderr or stdout or "")[-300:])
+    return []
 
 
 def _is_ready_audio(path: Path) -> bool:

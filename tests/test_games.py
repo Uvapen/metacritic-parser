@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from app.web.routes import like_needle
+from app.web.routes import like_needle, status_ru
 from app.web import routes as web_routes
 
 
@@ -9,6 +9,12 @@ def test_like_needle_escapes_wildcards():
     assert like_needle("100%") == r"%100\%%"
     assert like_needle("") is None
     assert like_needle("   ") is None
+
+
+def test_status_ru_includes_run_number():
+    assert status_ru("enriching", 1) == "очередь обогащения прогона №1"
+    assert status_ru("running", 3) == "идёт прогон №3"
+    assert status_ru("success") == "успех"
 
 
 def test_llm_monitor_filters_include_fallback_model_and_tags(tmp_path, monkeypatch):

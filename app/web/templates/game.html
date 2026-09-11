@@ -148,7 +148,7 @@
         {% endif %}
         <div class="body">
           <strong>Трейлер</strong>
-          <p class="muted">{{ game.video_title or "Metacritic" }}</p>
+          <p class="muted media-caption">{{ game.video_title or "Metacritic" }}</p>
         </div>
       </article>
       <article class="media-card">
@@ -160,13 +160,15 @@
           </button>
         {% elif game.youtube_summary_source == "none" %}
           <div class="media-placeholder">Подходящий летсплей не найден</div>
+        {% elif awaiting_youtube %}
+          <div class="media-placeholder">летсплей в очереди — появится на этой странице, как дойдёт задача</div>
         {% else %}
           <div class="media-placeholder">появится после обработки летсплеев</div>
         {% endif %}
         <div class="body">
           <strong>Летсплей</strong>
           {% if game is letsplay_ready and game.youtube_summary %}
-            <p class="muted">
+            <p class="muted media-caption">
               {{ game.youtube_title or "YouTube" }}
               {% if game.youtube_channel %} · {{ game.youtube_channel }}{% endif %}
               {% if game.youtube_duration_sec %} · {{ game.youtube_duration_sec|yt_duration }}{% endif %}
@@ -177,7 +179,11 @@
               <p><a href="{{ game.youtube_url }}" target="_blank" rel="noreferrer">Смотреть на YouTube</a></p>
             {% endif %}
           {% elif game.youtube_summary_source == "none" %}
-            <p class="muted">{{ game.youtube_summary or "Подходящий летсплей не найден." }}</p>
+            <p class="muted media-caption">{{ game.youtube_summary or "Подходящий летсплей не найден." }}</p>
+          {% elif awaiting_youtube %}
+            <p class="muted media-caption">в очереди этого прогона — страница обновится сама</p>
+          {% else %}
+            <p class="muted media-caption">ожидает обработку</p>
           {% endif %}
         </div>
       </article>
@@ -267,6 +273,9 @@
   {% if similar_games %}
     <section>
       <h2>Похожие игры</h2>
+      {% if awaiting_similar %}
+        <p class="muted">Список может дополниться: задача похожих этой игры ещё в очереди.</p>
+      {% endif %}
       <div class="grid">
         {% for item in similar_games %}
           <a class="card similar-card" href="/games/{{ item.slug }}">
@@ -306,7 +315,11 @@
   {% else %}
     <section>
       <h2>Похожие игры</h2>
-      <p class="muted">Пока мало пересечений в каталоге — блок заполнится по мере роста базы.</p>
+      {% if awaiting_similar %}
+        <p class="muted">Считаются в очереди этого прогона — страница обновится, как только задача дойдёт до этой игры.</p>
+      {% else %}
+        <p class="muted">Пока мало пересечений в каталоге — блок заполнится по мере роста базы.</p>
+      {% endif %}
     </section>
   {% endif %}
 
@@ -347,5 +360,8 @@
     };
     document.querySelector("[data-media-close]").addEventListener("click", closeModal);
     modal.addEventListener("close", () => frame.removeAttribute("src"));
+    {% if awaiting_enrichment %}
+    setTimeout(() => location.reload(), 8000);
+    {% endif %}
   </script>
 {% endblock %}

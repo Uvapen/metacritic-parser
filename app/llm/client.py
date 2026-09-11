@@ -612,6 +612,37 @@ class LLMClient:
         self.final_errors += 1
         return last
 
+    async def note(
+        self,
+        *,
+        prompt: str,
+        error: str | None = None,
+        response: str = "",
+        slug: str | None = None,
+        kind: str | None = None,
+        model: str = "youtube",
+    ) -> int:
+        """Строка в JSONL без HTTP: пустой поиск YouTube или похожие без LLM."""
+        result = LLMResult(
+            text=response,
+            model=model,
+            stub=bool(response) and error is None,
+            latency_ms=0,
+            error=error,
+            kind=kind,
+        )
+        result.log_id = await self._append_log(
+            prompt=prompt,
+            system=None,
+            result=result,
+            slug=slug,
+            run_id=self.run_id,
+            attempt=1,
+            kind=kind,
+        )
+        result.log_ids = [result.log_id]
+        return result.log_id
+
     async def _one_transcription(
         self,
         audio: bytes,

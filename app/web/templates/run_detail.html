@@ -4,11 +4,18 @@
   <p class="muted"><a href="/monitor">← к монитору</a></p>
   <h1>
     Прогон #{{ run.id }} · {{ run.started_at|localtime }} → {{ run.finished_at|localtime(true) }}
-    <span class="pill {{ run.status }}">{{ run.status|status_ru }}</span>
+    <span class="pill {{ run.status }}">{{ run.status|status_ru(run.id) }}</span>
   </h1>
     <p>
       новых {{ counts.new }} · обновлено {{ counts.updated }} · пропущено {{ counts.skipped }} · ошибок {{ counts.error }}
     </p>
+    {% if run.status == "enriching" %}
+      <p class="muted">
+        Карточки уже в каталоге. Прогон закроется как успех, когда опустеет очередь именно этого прогона:
+        похожие <strong>{{ queue_similar }}</strong> · летсплеи <strong>{{ queue_youtube }}</strong>.
+        Готовые летсплеи и похожие появляются на странице игры сразу после своей задачи.
+      </p>
+    {% endif %}
     <p>
       Вызовов LLM: {{ llm_calls }}
       · ошибок:
@@ -115,5 +122,8 @@
       }
       window.addEventListener("hashchange", highlight);
     })();
+    {% if run.status in ("running", "enriching") %}
+    setTimeout(() => location.reload(), 8000);
+    {% endif %}
   </script>
 {% endblock %}

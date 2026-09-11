@@ -258,6 +258,8 @@ def _ensure_game_columns(sync_connection) -> None:
             sync_connection.execute(
                 text("ALTER TABLE pipeline_state ADD COLUMN youtube_done BOOLEAN DEFAULT 1")
             )
+        if "hourly_due_at" not in state_cols:
+            sync_connection.execute(text("ALTER TABLE pipeline_state ADD COLUMN hourly_due_at DATETIME"))
 
 
 async def init_db() -> None:

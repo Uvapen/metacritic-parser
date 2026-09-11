@@ -806,6 +806,14 @@ async def review_mixed_similars(
                 if extra_keep:
                     logger.info("LLM keep вне кандидатов %s: %s", origin.slug, sorted(extra_keep))
                 reviewed += 1
+        elif llm is not None and hasattr(llm, "note") and not pending:
+            await llm.note(
+                prompt=f"[similar] {origin.title or origin.slug}",
+                response="LLM не вызывался: уверенные пары или нет смешанных кандидатов",
+                slug=origin.slug,
+                kind="similar",
+                model="heuristic",
+            )
         verdicts = await _load_verdicts(session, origin, by_slug, [hit["slug"] for hit in hits])
         kept = apply_mixed_filter(hits, verdicts, catalog_size=catalog_size)
         await _persist_kept_pairs(session, origin, by_slug, kept)

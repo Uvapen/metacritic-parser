@@ -23,6 +23,8 @@ from fastapi import FastAPI
 from app.config import get_settings
 from app.db import init_db
 from app.services.pipeline import (
+    bump_hourly_due_at,
+    next_hourly_due_at,
     recover_enrichment_on_startup,
     run_hourly_pipeline,
     tick_pipeline_stages,
@@ -46,14 +48,23 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await init_db()
     if settings.scheduler_enabled:
         scheduler.configure(event_loop=asyncio.get_running_loop())
+        first_hourly = await next_hourly_due_at(
+            interval_hours=settings.pipeline_interval_hours
+        )
+
+        async def scheduled_hourly_pipeline() -> None:
+            await bump_hourly_due_at(interval_hours=settings.pipeline_interval_hours)
+            await run_hourly_pipeline(manual=False)
+
         scheduler.add_job(
-            run_hourly_pipeline,
+            scheduled_hourly_pipeline,
             "interval",
             hours=settings.pipeline_interval_hours,
             id="hourly_pipeline",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            next_run_time=first_hourly,
         )
         tick_seconds = max(5, int(float(settings.enrichment_tick_seconds) or 20))
         scheduler.add_job(
@@ -69,8 +80,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         scheduler.start()
         await recover_enrichment_on_startup()
         logger.info(
-            "Планировщик запущен: интервал %s ч, очередь similar/youtube каждые %s с",
+            "Планировщик запущен: интервал %s ч, следующий hourly %s, очередь similar/youtube каждые %s с",
             settings.pipeline_interval_hours,
+            first_hourly.isoformat(),
             tick_seconds,
         )
     yield
