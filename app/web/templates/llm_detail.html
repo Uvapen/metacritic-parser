@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Диалог LLM #{{ item.id }} — Metacritic Parser{% endblock %}
+{% block content %}
+  <p class="muted crumbs">
+    {% if item.run_id %}
+      <a href="/runs/{{ item.run_id }}{% if item.game_slug %}#game-{{ item.game_slug }}{% endif %}">← прогон #{{ item.run_id }}</a>
+      ·
+    {% endif %}
+    <a href="{{ llm_table_href }}">← вызовы LLM</a>
+  </p>
+  <h1>Диалог LLM #{{ item.id }}</h1>
+  <div class="panel">
+    <p>
+      {{ item.ts|localtime }}
+      · {{ item.model or "—" }}
+      {% if item.stub %}<span class="pill">stub</span>{% endif %}
+      · {{ item.latency_ms if item.latency_ms is not none else "—" }} мс
+      · {{ "успех" if item.ok else "ошибка" }}
+      {% if item.kind %} · {{ item.kind|llm_kind_ru }}{% endif %}
+      · прогон
+      {% if item.run_id %}
+        <a href="/runs/{{ item.run_id }}{% if item.game_slug %}#game-{{ item.game_slug }}{% endif %}">#{{ item.run_id }}</a>
+      {% else %}
+        —
+      {% endif %}
+      {% if item.origin_id %}
+        · <a href="{{ item.origin_href }}">retry id-{{ item.origin_id }}</a>
+      {% endif %}
+    </p>
+    {% if item.slug %}
+      <p>Игра: <a href="/games/{{ item.slug }}">{{ item.slug }}</a></p>
+    {% endif %}
+  </div>
+
+  <section class="panel dialog-block">
+    <h2>System</h2>
+    <pre>{{ item.system or "—" }}</pre>
+  </section>
+  <section class="panel dialog-block">
+    <h2>Prompt</h2>
+    <pre>{{ item.prompt or "—" }}</pre>
+  </section>
+  {% if item.error %}
+    <section class="panel dialog-block">
+      <h2>Ошибка</h2>
+      <pre>{{ item.error }}</pre>
+    </section>
+  {% endif %}
+  <section class="panel dialog-block">
+    <h2>Response</h2>
+    <pre>{{ item.response or "—" }}</pre>
+  </section>
+{% endblock %}

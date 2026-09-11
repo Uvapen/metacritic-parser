@@ -1,0 +1,351 @@
+{% extends "base.html" %}
+{% block title %}{{ game.title }} — Metacritic Parser{% endblock %}
+{% block content %}
+  <p class="muted"><a href="/games">← ко всем играм</a></p>
+  <div class="cover-row">
+    <div class="cover-box">
+      {% if game.cover_url %}
+        <img src="{{ game.cover_url|cover }}" alt="{{ game.title }}">
+      {% else %}
+        <div class="cover-placeholder">No Image</div>
+      {% endif %}
+    </div>
+    <div>
+      <h1>{{ game.title }}</h1>
+      <p class="muted">
+        {% if game.developers %}{{ game.developers | join(", ") }}{% else %}{{ game.developer or "разработчик неизвестен" }}{% endif %}
+        {% if game.publishers %} · {{ game.publishers | join(", ") }}{% endif %}
+        · {{ game.release_date or "без даты" }}
+        · <a href="https://www.metacritic.com/game/{{ game.slug }}/" target="_blank" rel="noreferrer">Metacritic</a>
+      </p>
+      {% if game.genres %}
+        <p>{% for genre in game.genres %}<span class="pill">{{ genre }}</span> {% endfor %}
+          {% if game.genre_detailed %}<span class="pill">{{ game.genre_detailed }}</span>{% endif %}
+        </p>
+      {% elif game.genre_detailed %}
+        <p><span class="pill">{{ game.genre_detailed }}</span></p>
+      {% endif %}
+      {% set game_tags = game.tags or game.ai_tags %}
+      {% if game_tags %}
+        <div class="fact">
+          <div class="fact-label">Теги</div>
+          <div class="fact-pills">
+            {% for tag in game_tags %}<span class="pill">{{ tag }}</span>{% endfor %}
+          </div>
+        </div>
+      {% endif %}
+      {% if game.key_features %}
+        <div class="fact">
+          <div class="fact-label">Особенности</div>
+          <ul class="fact-list">
+            {% for feat in game.key_features %}
+              <li>{{ feat }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+      {% if game.target_audience %}
+        <div class="fact">
+          <div class="fact-label">Для кого</div>
+          <p class="fact-text">{{ game.target_audience }}</p>
+        </div>
+      {% endif %}
+      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem; margin:0.8rem 0;">
+        {% if game.metascore is not none %}
+          <span class="score {% if game.metascore >= 75 %}good{% elif game.metascore >= 50 %}mixed{% else %}bad{% endif %}">{{ game.metascore }}</span>
+          <span class="muted">metascore</span>
+        {% else %}
+          <span class="score empty">tbd</span>
+          <span class="muted">появится после 4 рецензий критиков</span>
+        {% endif %}
+        {% if game.userscore is not none %}
+          <span class="score {% if game.userscore >= 7.5 %}good{% elif game.userscore >= 5 %}mixed{% else %}bad{% endif %}">{{ game.userscore }}</span>
+          <span class="muted">userscore</span>
+        {% else %}
+          <span class="score empty">tbd</span>
+          <span class="muted">появится после 4 оценок игроков</span>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {% if game.description %}
+    <section class="panel">
+      <p class="game-blurb">{{ game.description }}</p>
+    </section>
+  {% endif %}
+
+    <section>
+      <h2>Саммари отзывов</h2>
+      <div class="summaries-grid">
+        <div class="panel">
+          <h3>Критики говорят</h3>
+          {% if critic_summary %}
+            <p>{{ critic_summary.content }}</p>
+            <p class="muted"><span class="pill">{{ critic_summary.model }}</span> {{ critic_summary.created_at|localtime }}</p>
+          {% else %}
+            <p class="muted">мало отзывов</p>
+          {% endif %}
+        </div>
+        <div class="panel">
+          <h3>Игроки говорят</h3>
+          {% if user_summary %}
+            <p>{{ user_summary.content }}</p>
+            <p class="muted"><span class="pill">{{ user_summary.model }}</span> {{ user_summary.created_at|localtime }}</p>
+          {% else %}
+            <p class="muted">мало отзывов</p>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+  {% if game.platform_scores %}
+    <section class="panel">
+      <h2>Платформы</h2>
+      <table>
+        <thead>
+          <tr><th>Платформа</th><th>Metascore</th><th>Userscore</th><th>Релиз</th></tr>
+        </thead>
+        <tbody>
+          {% for item in game.platform_scores %}
+            <tr>
+              <td>{{ item.platform }}</td>
+              <td>
+                {% if item.metascore is not none %}
+                  <span class="score {% if item.metascore >= 75 %}good{% elif item.metascore >= 50 %}mixed{% else %}bad{% endif %}">{{ item.metascore }}</span>
+                {% else %}
+                  <span class="score empty">tbd</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if item.userscore is not none %}
+                  <span class="score {% if item.userscore >= 7.5 %}good{% elif item.userscore >= 5 %}mixed{% else %}bad{% endif %}">{{ item.userscore }}</span>
+                {% else %}
+                  <span class="score empty">tbd</span>
+                {% endif %}
+              </td>
+              <td>{{ item.release_date or "—" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  {% endif %}
+
+  <section class="media-block">
+    <h2>Медиа</h2>
+    <div class="media-grid">
+      <article class="media-card">
+        {% if game.video_url %}
+          <button type="button" class="media-thumb" data-media-src="{{ game.video_url }}" aria-label="Смотреть трейлер">
+            {% if game.cover_url %}
+              <img src="{{ game.cover_url|cover }}" alt="">
+            {% endif %}
+            <span class="play">▶</span>
+          </button>
+        {% else %}
+          <div class="media-placeholder">Трейлер появится, когда Metacritic отдаст видео</div>
+        {% endif %}
+        <div class="body">
+          <strong>Трейлер</strong>
+          <p class="muted">{{ game.video_title or "Metacritic" }}</p>
+        </div>
+      </article>
+      <article class="media-card">
+        {% set yt_id = game.youtube_url|youtube_id %}
+        {% if game.youtube_url and yt_id and game is letsplay_ready %}
+          <button type="button" class="media-thumb" data-media-src="https://www.youtube.com/embed/{{ yt_id }}" aria-label="Смотреть летсплей">
+            <img src="https://i.ytimg.com/vi/{{ yt_id }}/hqdefault.jpg" alt="">
+            <span class="play">▶</span>
+          </button>
+        {% elif game.youtube_summary_source == "none" %}
+          <div class="media-placeholder">Подходящий летсплей не найден</div>
+        {% else %}
+          <div class="media-placeholder">появится после обработки летсплеев</div>
+        {% endif %}
+        <div class="body">
+          <strong>Летсплей</strong>
+          {% if game is letsplay_ready and game.youtube_summary %}
+            <p class="muted">
+              {{ game.youtube_title or "YouTube" }}
+              {% if game.youtube_channel %} · {{ game.youtube_channel }}{% endif %}
+              {% if game.youtube_duration_sec %} · {{ game.youtube_duration_sec|yt_duration }}{% endif %}
+              {% if game.youtube_views %} · {{ game.youtube_views|yt_views }} просмотров{% endif %}
+            </p>
+            <p>{{ game.youtube_summary }}</p>
+            {% if game.youtube_url %}
+              <p><a href="{{ game.youtube_url }}" target="_blank" rel="noreferrer">Смотреть на YouTube</a></p>
+            {% endif %}
+          {% elif game.youtube_summary_source == "none" %}
+            <p class="muted">{{ game.youtube_summary or "Подходящий летсплей не найден." }}</p>
+          {% endif %}
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <dialog id="media-modal" class="media-modal">
+    <button type="button" class="media-modal-close" data-media-close aria-label="Закрыть">×</button>
+    <div class="media-modal-frame">
+      <iframe id="media-modal-frame" allow="autoplay; fullscreen" allowfullscreen title="Видео"></iframe>
+    </div>
+  </dialog>
+
+  <section class="panel">
+    <h2>Критики</h2>
+    {% if critic_reviews %}
+      {% for review in critic_reviews %}
+      <div class="review{% if loop.index > 2 %} review-extra hidden{% endif %}">
+        <div class="review-head">
+          <strong>{{ review.publication or "издание" }}</strong>
+          {% if review.score is not none %}
+            <span class="score {% if review.score >= 75 %}good{% elif review.score >= 50 %}mixed{% else %}bad{% endif %}">{{ review.score|int }}</span>
+          {% endif %}
+        </div>
+        {% if review.body and review.body|length > 300 %}
+          <p>
+            <span class="rev-short">{{ review.body[:300] }}…</span>
+            <span class="rev-full hidden">{{ review.body }}</span>
+            <button type="button" class="link-btn" data-rev-expand>развернуть</button>
+          </p>
+        {% else %}
+          <p>{{ review.body }}</p>
+        {% endif %}
+        {% set meta_parts = [] %}
+        {% if review.author %}{% set _ = meta_parts.append(review.author) %}{% endif %}
+        {% if review.reviewed_at %}{% set _ = meta_parts.append(review.reviewed_at) %}{% endif %}
+        {% if review.platform %}{% set _ = meta_parts.append(review.platform) %}{% endif %}
+        {% if meta_parts %}
+          <p class="muted">{{ meta_parts | join(" · ") }}</p>
+        {% endif %}
+      </div>
+      {% endfor %}
+      {% if critic_reviews|length > 2 %}
+        <button type="button" class="review-toggle" data-review-toggle data-total="{{ critic_reviews|length }}">Показать все ({{ critic_reviews|length }})</button>
+      {% endif %}
+    {% else %}
+      <p class="muted">Отзывов критиков пока нет.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Игроки</h2>
+    {% if user_reviews %}
+      {% for review in user_reviews %}
+      <div class="review{% if loop.index > 2 %} review-extra hidden{% endif %}">
+        <div class="review-head">
+          <strong>{{ review.author or "игрок" }}</strong>
+          {% if review.score is not none %}
+            <span class="score {% if review.score >= 7.5 %}good{% elif review.score >= 5 %}mixed{% else %}bad{% endif %}">{{ review.score }}</span>
+          {% endif %}
+        </div>
+        {% if review.body and review.body|length > 300 %}
+          <p>
+            <span class="rev-short">{{ review.body[:300] }}…</span>
+            <span class="rev-full hidden">{{ review.body }}</span>
+            <button type="button" class="link-btn" data-rev-expand>развернуть</button>
+          </p>
+        {% else %}
+          <p>{{ review.body }}</p>
+        {% endif %}
+        {% set meta_parts = [] %}
+        {% if review.reviewed_at %}{% set _ = meta_parts.append(review.reviewed_at) %}{% endif %}
+        {% if review.platform %}{% set _ = meta_parts.append(review.platform) %}{% endif %}
+        {% if meta_parts %}
+          <p class="muted">{{ meta_parts | join(" · ") }}</p>
+        {% endif %}
+      </div>
+      {% endfor %}
+      {% if user_reviews|length > 2 %}
+        <button type="button" class="review-toggle" data-review-toggle data-total="{{ user_reviews|length }}">Показать все ({{ user_reviews|length }})</button>
+      {% endif %}
+    {% else %}
+      <p class="muted">Пользовательских отзывов пока нет.</p>
+    {% endif %}
+  </section>
+
+  {% if similar_games %}
+    <section>
+      <h2>Похожие игры</h2>
+      <div class="grid">
+        {% for item in similar_games %}
+          <a class="card similar-card" href="/games/{{ item.slug }}">
+            {% if item.cover_url %}
+              <div class="cover-box">
+                <img src="{{ item.cover_url|cover }}" alt="{{ item.title }}">
+              </div>
+            {% else %}
+              <div class="cover-box">
+                <div class="cover-placeholder">No Image</div>
+              </div>
+            {% endif %}
+            <div class="body">
+              <strong class="game-title">{{ item.title }}</strong>
+              {% if item.developer %}
+                <div class="similar-meta">{{ item.developer }}</div>
+              {% endif %}
+              {% if item.chips %}
+                <div class="similar-tags">
+                  {% for chip in item.chips %}
+                    <span class="pill reason">{{ chip }}</span>
+                  {% endfor %}
+                </div>
+              {% endif %}
+              <div class="similar-scoreline">
+                {% if item.metascore is not none %}
+                  <span class="score {% if item.metascore >= 75 %}good{% elif item.metascore >= 50 %}mixed{% else %}bad{% endif %}">{{ item.metascore }}</span>
+                {% else %}
+                  <span class="score empty">tbd</span>
+                {% endif %}
+              </div>
+            </div>
+          </a>
+        {% endfor %}
+      </div>
+    </section>
+  {% else %}
+    <section>
+      <h2>Похожие игры</h2>
+      <p class="muted">Пока мало пересечений в каталоге — блок заполнится по мере роста базы.</p>
+    </section>
+  {% endif %}
+
+  <script>
+    document.querySelectorAll("[data-review-toggle]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const root = button.closest("section");
+        const extras = root.querySelectorAll(".review-extra");
+        const expanded = button.dataset.expanded === "1";
+        extras.forEach((el) => el.classList.toggle("hidden", expanded));
+        const total = button.dataset.total;
+        button.textContent = expanded ? `Показать все (${total})` : "Свернуть";
+        button.dataset.expanded = expanded ? "0" : "1";
+      });
+    });
+    document.querySelectorAll("[data-rev-expand]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const wrap = button.parentElement;
+        const shortEl = wrap.querySelector(".rev-short");
+        const fullEl = wrap.querySelector(".rev-full");
+        const expanded = !fullEl.classList.contains("hidden");
+        fullEl.classList.toggle("hidden", expanded);
+        shortEl.classList.toggle("hidden", !expanded);
+        button.textContent = expanded ? "развернуть" : "свернуть";
+      });
+    });
+    const modal = document.getElementById("media-modal");
+    const frame = document.getElementById("media-modal-frame");
+    document.querySelectorAll("[data-media-src]").forEach((button) => {
+      button.addEventListener("click", () => {
+        frame.src = button.dataset.mediaSrc;
+        modal.showModal();
+      });
+    });
+    const closeModal = () => {
+      modal.close();
+      frame.removeAttribute("src");
+    };
+    document.querySelector("[data-media-close]").addEventListener("click", closeModal);
+    modal.addEventListener("close", () => frame.removeAttribute("src"));
+  </script>
+{% endblock %}

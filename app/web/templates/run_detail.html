@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}Прогон #{{ run.id }} — Metacritic Parser{% endblock %}
+{% block content %}
+  <p class="muted"><a href="/monitor">← к монитору</a></p>
+  <h1>
+    Прогон #{{ run.id }} · {{ run.started_at|localtime }} → {{ run.finished_at|localtime(true) }}
+    <span class="pill {{ run.status }}">{{ run.status|status_ru }}</span>
+  </h1>
+    <p>
+      новых {{ counts.new }} · обновлено {{ counts.updated }} · пропущено {{ counts.skipped }} · ошибок {{ counts.error }}
+    </p>
+    <p>
+      Вызовов LLM: {{ llm_calls }}
+      · ошибок:
+      {% if llm_errors > 0 %}
+        <span class="error-n">{{ llm_errors }}</span>
+      {% else %}
+        {{ llm_errors }}
+      {% endif %}
+    </p>
+  {% if run.error_message %}
+    <p class="muted">{{ run.error_message }}</p>
+  {% endif %}
+
+  <section class="panel">
+    <h2>Игры прогона</h2>
+    {% if details %}
+      <table>
+        <thead>
+          <tr>
+            <th>Название</th>
+            <th>Статус</th>
+            <th>Изменения</th>
+            <th>LLM</th>
+            <th>Ошибка</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in details %}
+            <tr{% if item.slug %} id="game-{{ item.slug }}"{% endif %}>
+              <td>
+                {% if item.slug %}
+                  <a href="/games/{{ item.slug }}">{{ item.title or item.slug }}</a>
+                {% else %}
+                  {{ item.title or "—" }}
+                {% endif %}
+              </td>
+              <td>
+                <span class="pill {{ item.action }}">{{ item.action|action_ru }}</span>
+                {% if item.reason %}
+                  <div class="muted status-reason">{{ item.reason }}</div>
+                {% endif %}
+              </td>
+              <td>
+                {% if item.changes %}
+                  <details class="changes-box">
+                    <summary>{{ item.changes|change_summary }}</summary>
+                    <ul class="changes">
+                      {% for change in item.changes %}
+                        <li>{{ change|change_line }}</li>
+                      {% endfor %}
+                    </ul>
+                  </details>
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+              <td>
+                {% if item.llm_links %}
+                  {% for link in item.llm_links %}
+                    <a href="{{ link.href }}">#{{ link.id }}{% if link.kind %} {{ link.kind|llm_kind_ru }}{% endif %}</a>{% if not loop.last %}<br>{% endif %}
+                  {% endfor %}
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+              <td>
+                {% if item.error %}
+                  <div class="muted">{{ item.error }}</div>
+                {% endif %}
+                {% if item.llm_error_links %}
+                  {% for link in item.llm_error_links %}
+                    <a href="{{ link.href }}">#{{ link.id }}{% if link.kind %} {{ link.kind|llm_kind_ru }}{% endif %}</a>{% if not loop.last %}<br>{% endif %}
+                  {% endfor %}
+                {% elif not item.error %}
+                  —
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">В этом прогоне нет детализации игр.</p>
+    {% endif %}
+  </section>
+
+  <script>
+    (function () {
+      let timer = null;
+      const highlight = () => {
+        const hash = location.hash;
+        if (!hash || hash.length < 2) return;
+        const el = document.getElementById(decodeURIComponent(hash.slice(1)));
+        if (!el) return;
+        el.classList.add("highlight-row");
+        el.scrollIntoView({ block: "center" });
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => el.classList.remove("highlight-row"), 4000);
+      };
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", highlight);
+      } else {
+        highlight();
+      }
+      window.addEventListener("hashchange", highlight);
+    })();
+  </script>
+{% endblock %}

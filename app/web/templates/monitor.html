@@ -1,0 +1,357 @@
+{% extends "base.html" %}
+{% from "macros.html" import pagination with context %}
+{% block title %}Монитор — Metacritic Parser{% endblock %}
+{% block content %}
+  <h1>Монитор прогонов</h1>
+  <p class="muted">Hourly-пайплайн ходит на Metacritic, обновляет базу и пишет LLM-логи в <code>data/llm_logs.jsonl</code>.</p>
+
+  <div class="panel">
+    <p>
+      Статус:
+      {% if pipeline_running %}
+        <span class="pill running">идёт прогон</span>
+      {% else %}
+        <span class="pill">ожидание</span>
+      {% endif %}
+    </p>
+    <p>
+      Следующий прогон через
+      <strong id="next-run-countdown" data-next-run="{{ next_run_at or "" }}">—</strong>
+      {% if queue_similar or queue_youtube or enrichment_running %}
+        · очередь: похожие <strong>{{ queue_similar }}</strong>
+        · летсплеи <strong>{{ queue_youtube }}</strong>
+        {% if enrichment_running %}<span class="pill running">идёт задача</span>{% endif %}
+      {% endif %}
+      {% if groq_pause_sec %}
+        · Groq пауза ~<strong>{{ groq_pause_sec }}</strong> с
+      {% endif %}
+    </p>
+    <p>Игр в базе: <strong>{{ games_count }}</strong> · вызовов LLM всего: <strong>{{ llm_calls }}</strong></p>
+    {% if last_run %}
+      <p>
+        Последний прогон: #{{ last_run.id }}, финиш {{ last_run.finished_at|localtime(true) }},
+        новых {{ last_counts.new }} · обновлено {{ last_counts.updated }} · пропущено {{ last_counts.skipped }} · ошибок {{ last_counts.error }} (LLM: {{ last_llm_errors }})
+        · <a href="/runs/{{ last_run.id }}">детали</a>
+      </p>
+    {% endif %}
+    <div class="run-actions">
+      <button class="btn" id="run-btn" {% if pipeline_running %}disabled{% endif %}>Запустить сейчас</button>
+      <button class="btn" id="similar-btn">Запустить похожие</button>
+      <button class="btn" id="youtube-btn">Запустить летсплеи</button>
+      <label class="inline-check" title="Снова вызвать LLM даже если отзывы не менялись. Без галочки саммари пропускается, пока fingerprint отзывов тот же.">
+        <input type="checkbox" id="force-resummarize">
+        пересуммировать всё (игнорировать fingerprint)
+      </label>
+      <span id="run-msg" class="muted"></span>
+    </div>
+  </div>
+
+  <section class="panel" id="runs-table">
+    <h2>Журнал прогонов</h2>
+    <form class="filters" method="get" action="/monitor" data-anchor="#runs-table" id="runs-filters">
+      {% if llm_page > 1 %}
+        <input type="hidden" name="llm_page" value="{{ llm_page }}">
+      {% endif %}
+      {% if llm_model %}
+        <input type="hidden" name="model" value="{{ llm_model }}">
+      {% endif %}
+      {% if llm_ok %}
+        <input type="hidden" name="ok" value="{{ llm_ok }}">
+      {% endif %}
+      {% if llm_date_from %}
+        <input type="hidden" name="date_from" value="{{ llm_date_from }}">
+      {% endif %}
+      {% if llm_date_to %}
+        <input type="hidden" name="date_to" value="{{ llm_date_to }}">
+      {% endif %}
+      {% if llm_run %}
+        <input type="hidden" name="llm_run" value="{{ llm_run }}">
+      {% endif %}
+      {% if llm_kind %}
+        <input type="hidden" name="kind" value="{{ llm_kind }}">
+      {% endif %}
+      <label>
+        Статус
+        <select name="run_status">
+          <option value="" {% if not run_status %}selected{% endif %}>все</option>
+          <option value="success" {% if run_status == "success" %}selected{% endif %}>success</option>
+          <option value="partial" {% if run_status == "partial" %}selected{% endif %}>partial</option>
+          <option value="error" {% if run_status == "error" %}selected{% endif %}>error</option>
+          <option value="running" {% if run_status == "running" %}selected{% endif %}>running</option>
+          <option value="skipped" {% if run_status == "skipped" %}selected{% endif %}>skipped</option>
+        </select>
+      </label>
+      <label>
+        С
+        <input type="date" name="run_from" value="{{ run_from }}">
+      </label>
+      <label>
+        По
+        <input type="date" name="run_to" value="{{ run_to }}">
+      </label>
+      <a class="btn" data-scroll-restore href="/monitor{{ monitor_qs(llm_page=llm_page, model=llm_model, ok=llm_ok, date_from=llm_date_from, date_to=llm_date_to, llm_run=llm_run, kind=llm_kind) }}#runs-table">Сбросить</a>
+    </form>
+    {% if runs %}
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Статус</th>
+            <th>Старт</th>
+            <th>Финиш</th>
+            <th>Обработано</th>
+            <th>LLM-ошибок</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in runs %}
+            <tr>
+              <td>{{ run.id }}</td>
+              <td><span class="pill {{ run.status }}">{{ run.status|status_ru }}</span></td>
+              <td>{{ run.started_at|localtime }}</td>
+              <td>{{ run.finished_at|localtime }}</td>
+              <td>{{ run.games_processed }}</td>
+              <td>
+                {% set run_llm_errors = run|llm_error_count %}
+                {% if run_llm_errors > 0 %}
+                  <span class="error-n">{{ run_llm_errors }}</span>
+                {% else %}
+                  0
+                {% endif %}
+              </td>
+              <td>
+                <a href="/runs/{{ run.id }}">детали</a>
+                {% if run.error_message %}
+                  <div class="muted">{{ run.error_message }}</div>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {{ pagination(page, total_pages, runs_base, 'page', 'runs-table', true) }}
+    {% else %}
+      <p class="muted">{% if run_status or run_from or run_to %}Ничего не найдено.{% else %}Прогонов ещё не было.{% endif %}</p>
+    {% endif %}
+  </section>
+
+  <section class="panel" id="llm-table">
+    <h2>Вызовы LLM</h2>
+    <form class="filters" method="get" action="/monitor" data-anchor="#llm-table" id="llm-filters">
+      {% if page > 1 %}
+        <input type="hidden" name="page" value="{{ page }}">
+      {% endif %}
+      {% if run_status %}
+        <input type="hidden" name="run_status" value="{{ run_status }}">
+      {% endif %}
+      {% if run_from %}
+        <input type="hidden" name="run_from" value="{{ run_from }}">
+      {% endif %}
+      {% if run_to %}
+        <input type="hidden" name="run_to" value="{{ run_to }}">
+      {% endif %}
+      <label>
+        Модель
+        <select name="model">
+          <option value="" {% if not llm_model %}selected{% endif %}>все</option>
+          {% for name in llm_models %}
+            <option value="{{ name }}" {% if llm_model == name %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Тип
+        <select name="kind">
+          <option value="" {% if not llm_kind %}selected{% endif %}>все</option>
+          {% for name in llm_kinds %}
+            <option value="{{ name }}" {% if llm_kind == name %}selected{% endif %}>{{ name|llm_kind_ru }}</option>
+          {% endfor %}
+          {% if llm_kind and llm_kind not in llm_kinds %}
+            <option value="{{ llm_kind }}" selected>{{ llm_kind|llm_kind_ru }}</option>
+          {% endif %}
+        </select>
+      </label>
+      <label>
+        Прогон
+        <input type="search" name="llm_run" value="{{ llm_run }}" placeholder="№ прогона" autocomplete="off">
+      </label>
+      <label>
+        Статус
+        <select name="ok">
+          <option value="" {% if not llm_ok %}selected{% endif %}>все</option>
+          <option value="1" {% if llm_ok == "1" %}selected{% endif %}>успех</option>
+          <option value="0" {% if llm_ok == "0" %}selected{% endif %}>ошибка</option>
+        </select>
+      </label>
+      <label>
+        С
+        <input type="date" name="date_from" value="{{ llm_date_from }}">
+      </label>
+      <label>
+        По
+        <input type="date" name="date_to" value="{{ llm_date_to }}">
+      </label>
+      <a class="btn" data-scroll-restore href="/monitor{{ monitor_qs(page=page, run_status=run_status, run_from=run_from, run_to=run_to) }}#llm-table">Сбросить</a>
+    </form>
+    {% if llm_logs %}
+      <div class="table-wrap">
+      <table class="llm-calls">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Прогон</th>
+            <th>Время</th>
+            <th>Тип</th>
+            <th>Модель</th>
+            <th>Статус</th>
+            <th>Попытка</th>
+            <th>мс</th>
+            <th>Ошибка</th>
+            <th>Диалог</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in llm_logs %}
+            <tr id="llm-{{ item.id }}">
+              <td>
+                {% if item.run_id %}
+                  {% if item.game_slug %}
+                    <a href="/runs/{{ item.run_id }}#game-{{ item.game_slug }}">{{ item.id }}</a>
+                  {% else %}
+                    <a href="/runs/{{ item.run_id }}">{{ item.id }}</a>
+                  {% endif %}
+                {% else %}
+                  {{ item.id }}
+                {% endif %}
+              </td>
+              <td class="col-run">
+                {% if item.run_id %}
+                  {% if item.game_slug %}
+                    <a href="/runs/{{ item.run_id }}#game-{{ item.game_slug }}">#{{ item.run_id }}</a>
+                  {% else %}
+                    <a href="/runs/{{ item.run_id }}">#{{ item.run_id }}</a>
+                  {% endif %}
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+              <td>{{ item.ts|localtime }}</td>
+              <td>
+                {% if item.kind %}
+                  <span class="pill">{{ item.kind|llm_kind_ru }}</span>
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+              <td>{{ item.model }}{% if item.stub %} <span class="pill">stub</span>{% endif %}</td>
+              <td>{{ "успех" if item.ok else "ошибка" }}</td>
+              <td>
+                {% if item.origin_id %}
+                  <a href="{{ item.origin_href }}">retry id-{{ item.origin_id }}</a>
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+              <td>{{ item.latency_ms if item.latency_ms is not none else "—" }}</td>
+              <td class="muted wrap">{{ item.error or "" }}</td>
+              <td><a href="/llm/{{ item.id }}">диалог</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      {{ pagination(llm_page, llm_total_pages, llm_base, 'llm_page', 'llm-table') }}
+    {% else %}
+      <p class="muted">{% if llm_model or llm_ok or llm_date_from or llm_date_to or llm_run or llm_kind %}Ничего не найдено.{% else %}Файл логов пока пуст.{% endif %}</p>
+    {% endif %}
+  </section>
+
+  <script>
+    const message = document.getElementById("run-msg");
+    const forceBox = document.getElementById("force-resummarize");
+    let wasRunning = {{ "true" if pipeline_running or enrichment_running or queue_similar or queue_youtube else "false" }};
+
+    const runBtn = document.getElementById("run-btn");
+    const similarBtn = document.getElementById("similar-btn");
+    const youtubeBtn = document.getElementById("youtube-btn");
+    const setRunBusy = (busy) => {
+      if (runBtn) runBtn.disabled = busy;
+    };
+    const startStage = async (url, pendingText, body, lockRun) => {
+      if (lockRun) setRunBusy(true);
+      message.textContent = pendingText;
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: body ? JSON.stringify(body) : "{}",
+        });
+        const data = await response.json();
+        if (data.status === "accepted" || data.status === "already_running") {
+          wasRunning = true;
+          message.textContent = data.status === "already_running" ? "уже выполняется..." : "принято, очередь крутится...";
+        } else {
+          message.textContent = data.status;
+          if (lockRun) setRunBusy(false);
+        }
+      } catch (error) {
+        message.textContent = "не удалось запустить: " + error;
+        if (lockRun) setRunBusy(false);
+      }
+    };
+
+    runBtn?.addEventListener("click", () => {
+      startStage("/api/pipeline/run", "запускаем...", {
+        force_resummarize: Boolean(forceBox && forceBox.checked),
+      }, true);
+    });
+    similarBtn?.addEventListener("click", () => {
+      startStage("/api/pipeline/similar", "ставим похожих в очередь...");
+    });
+    youtubeBtn?.addEventListener("click", () => {
+      startStage("/api/pipeline/youtube", "ставим летсплеи в очередь...");
+    });
+
+    setInterval(async () => {
+      try {
+        const data = await (await fetch("/api/runs")).json();
+        const queue = Number(data.queue_similar || 0) + Number(data.queue_youtube || 0);
+        const running = Boolean(data.pipeline_running || data.enrichment_running || queue > 0);
+        if (wasRunning && !running) {
+          location.reload();
+          return;
+        }
+        wasRunning = running;
+      } catch (error) {}
+    }, 5000);
+
+    const tickOne = (el) => {
+      if (!el) return;
+      const raw = el.dataset.nextRun;
+      if (!raw) {
+        el.textContent = "—";
+        return;
+      }
+      const diff = new Date(raw).getTime() - Date.now();
+      if (Number.isNaN(diff)) {
+        el.textContent = "—";
+        return;
+      }
+      if (diff <= 0) {
+        el.textContent = "00:00:00";
+        return;
+      }
+      const hours = Math.floor(diff / 3600000);
+      const minutes = Math.floor((diff % 3600000) / 60000);
+      const seconds = Math.floor((diff % 60000) / 1000);
+      const pad = (value) => String(value).padStart(2, "0");
+      el.textContent = `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+    };
+    const tick = () => {
+      document.querySelectorAll("#next-run-countdown").forEach(tickOne);
+    };
+    tick();
+    setInterval(tick, 1000);
+  </script>
+{% endblock %}

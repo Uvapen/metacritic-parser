@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Игры — Metacritic Parser{% endblock %}
+{% block content %}
+  <h1>Последние игры</h1>
+  <p class="muted">
+    Данные появляются после hourly-прогона или ручного запуска на странице монитора.
+    <a href="/games">Все игры →</a>
+  </p>
+
+  {% if games %}
+    <div class="grid">
+      {% for game in games %}
+        <a class="card" href="/games/{{ game.slug }}">
+          {% if game.cover_url %}
+            <div class="cover-box">
+              <img src="{{ game.cover_url|cover }}" alt="{{ game.title }}">
+            </div>
+          {% else %}
+            <div class="cover-box">
+              <div class="cover-placeholder">No Image</div>
+            </div>
+          {% endif %}
+          <div class="body">
+            <strong class="game-title">{{ game.title }}</strong>
+            <div class="muted">{{ game.release_date or "дата неизвестна" }}</div>
+            <div style="margin-top:0.5rem; display:flex; gap:0.4rem;">
+              {% if game.metascore is not none %}
+                <span class="score {% if game.metascore >= 75 %}good{% elif game.metascore >= 50 %}mixed{% else %}bad{% endif %}">{{ game.metascore }}</span>
+              {% else %}
+                <span class="score empty">tbd</span>
+              {% endif %}
+              {% if game.userscore is not none %}
+                <span class="score {% if game.userscore >= 7.5 %}good{% elif game.userscore >= 5 %}mixed{% else %}bad{% endif %}">{{ game.userscore }}</span>
+              {% else %}
+                <span class="score empty">tbd</span>
+              {% endif %}
+            </div>
+          </div>
+        </a>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="panel">
+      <p>В базе пока нет игр. Откройте <a href="/monitor">монитор</a> и запустите пайплайн.</p>
+    </div>
+  {% endif %}
+{% endblock %}

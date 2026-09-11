@@ -1,0 +1,22 @@
+* text=auto eol=lf
+
+*.py text
+*.md text
+*.html text
+*.css text
+*.js text
+*.yml text
+*.yaml text
+*.json text
+*.toml text
+*.ini text
+*.txt text
+*.env.example text
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.exe binary

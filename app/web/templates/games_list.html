@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% from "macros.html" import pagination with context %}
+{% block title %}Все игры — Metacritic Parser{% endblock %}
+{% block content %}
+<h1>Все игры ({{ total }})</h1>
+
+<form class="filters" method="get" action="/games" id="games-filters">
+  <label>Поиск
+    <input type="search" name="q" value="{{ q }}" placeholder="название" autocomplete="off">
+  </label>
+  <label>Платформа
+    <select name="platform">
+      <option value="" {% if not platform %}selected{% endif %}>все</option>
+      {% for name in platforms %}
+        <option value="{{ name }}" {% if platform == name %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Сортировка
+    <select name="sort">
+      <option value="carousel" {% if sort == "carousel" %}selected{% endif %}>Сначала новинки</option>
+      <option value="rating" {% if sort == "rating" %}selected{% endif %}>По рейтингу</option>
+      <option value="date" {% if sort == "date" %}selected{% endif %}>По дате</option>
+    </select>
+  </label>
+  <label>Metascore
+    <select name="score">
+      <option value="all" {% if score == "all" %}selected{% endif %}>Все</option>
+      <option value="high" {% if score == "high" %}selected{% endif %}>75+</option>
+      <option value="mixed" {% if score == "mixed" %}selected{% endif %}>50–74</option>
+      <option value="low" {% if score == "low" %}selected{% endif %}>ниже 50</option>
+      <option value="tbd" {% if score == "tbd" %}selected{% endif %}>tbd</option>
+    </select>
+  </label>
+  <a class="btn" href="/games">Сбросить</a>
+</form>
+
+{% if games %}
+<div class="grid">
+  {% for game in games %}
+  <a class="card" href="/games/{{ game.slug }}">
+    {% if game.cover_url %}
+    <div class="cover-box">
+      <img src="{{ game.cover_url|cover }}" alt="{{ game.title }}">
+    </div>
+    {% else %}
+    <div class="cover-box">
+      <div class="cover-placeholder">No Image</div>
+    </div>
+    {% endif %}
+    <div class="body">
+      <strong class="game-title">{{ game.title }}</strong>
+      <div class="muted">{{ game.release_date or "дата неизвестна" }}</div>
+      <div style="margin-top:0.5rem; display:flex; gap:0.4rem;">
+        {% if game.metascore is not none %}
+        <span class="score {% if game.metascore >= 75 %}good{% elif game.metascore >= 50 %}mixed{% else %}bad{% endif %}">{{ game.metascore }}</span>
+        {% else %}
+        <span class="score empty">tbd</span>
+        {% endif %}
+        {% if game.userscore is not none %}
+        <span class="score {% if game.userscore >= 7.5 %}good{% elif game.userscore >= 5 %}mixed{% else %}bad{% endif %}">{{ game.userscore }}</span>
+        {% endif %}
+      </div>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="panel">
+  {% if q or platform or score != "all" %}
+  <p>Ничего не найдено. <a href="/games">Сбросить фильтры</a>.</p>
+  {% else %}
+  <p>В базе пока нет игр. Откройте <a href="/monitor">монитор</a> и запустите пайплайн.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{{ pagination(page, total_pages, games_base) }}
+{% endblock %}

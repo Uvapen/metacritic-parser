@@ -1,0 +1,36 @@
+{% macro page_href(base_url, param, n, fragment='') -%}
+{%- if n == 1 -%}
+{{ base_url }}
+{%- elif '?' in base_url -%}
+{{ base_url }}&{{ param }}={{ n }}
+{%- else -%}
+{{ base_url }}?{{ param }}={{ n }}
+{%- endif -%}
+{%- if fragment -%}#{{ fragment }}{%- endif -%}
+{%- endmacro %}
+
+{% macro pagination(page, total_pages, base_url, param='page', fragment='', show_single=false) %}
+{% if total_pages and (total_pages > 1 or show_single) %}
+<nav class="pagination" aria-label="Пагинация">
+  {% if page > 1 %}
+    <a href="{{ page_href(base_url, param, page - 1, fragment) }}" aria-label="Назад">←</a>
+  {% else %}
+    <span class="off" aria-hidden="true">←</span>
+  {% endif %}
+  {% for item in pagination_window(page, total_pages) %}
+    {% if item is none %}
+      <span class="ellipsis">…</span>
+    {% elif item == page %}
+      <span class="current">{{ item }}</span>
+    {% else %}
+      <a href="{{ page_href(base_url, param, item, fragment) }}">{{ item }}</a>
+    {% endif %}
+  {% endfor %}
+  {% if page < total_pages %}
+    <a href="{{ page_href(base_url, param, page + 1, fragment) }}" aria-label="Вперёд">→</a>
+  {% else %}
+    <span class="off" aria-hidden="true">→</span>
+  {% endif %}
+</nav>
+{% endif %}
+{% endmacro %}
