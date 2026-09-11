@@ -249,6 +249,7 @@ def test_letsplay_job_needed_until_transcript_or_no_captions():
     assert needs_letsplay_job(whisper_done) is False
     assert needs_letsplay_job(old_stub) is True
     assert needs_letsplay_job(new_stub) is False
+    assert needs_letsplay_job(new_stub, force=True) is True
     dump = SimpleNamespace(
         youtube_summary="Привет и добро пожаловать обратно на Rage Gaming, и чёрт возьми",
         youtube_summary_source="transcript",
@@ -385,5 +386,85 @@ def test_conclude_letsplay_rejects_video_blurb():
     )
     assert status == "blurb"
     assert game.youtube_summary is None
+
+
+def test_collapse_rolling_youtube_asr():
+    from app.services.youtube import CaptionCue, collapse_rolling_caption_text, sample_transcript
+
+    cues = [
+        CaptionCue(start=0.0, text="С момента создания этого канала"),
+        CaptionCue(start=1.0, text="С момента создания этого канала На YouTube почти все игры"),
+        CaptionCue(
+            start=2.0,
+            text="С момента создания этого канала На YouTube почти все игры серии Souls",
+        ),
+    ]
+    text = collapse_rolling_caption_text(cues)
+    assert text.count("С момента создания этого канала") == 1
+    assert "серии Souls" in text
+    sampled = sample_transcript(cues, duration_sec=120)
+    assert sampled.count("С момента создания этого канала") == 1
+
+
+def test_groq_letsplay_summary_is_shown_on_card():
+    from types import SimpleNamespace
+
+    from app.services.youtube import letsplay_has_summary
+
+    game = SimpleNamespace(
+        youtube_summary=(
+            "В ролике автор знакомит зрителей с игрой Crimson Moon, отмечая её "
+            "вдохновение серией Souls и рассказывая о ценах на PS5, Xbox и ПК."
+        ),
+        youtube_summary_source="transcript",
+        youtube_transcript_sample="С момента создания этого канала " * 40,
+    )
+    assert letsplay_has_summary(game) is True
+
+
+def test_attach_does_not_stub_when_whisper_fails():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from app.services.youtube import LETS_PLAY_STUB, YoutubeVideo, attach_letsplay
+
+    game = SimpleNamespace(
+        slug="crimson-moon",
+        title="Crimson Moon",
+        youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        youtube_title="old",
+        youtube_channel="ch",
+        youtube_views=1,
+        youtube_duration_sec=600,
+        youtube_kind="letsplay",
+        youtube_transcript_sample="x",
+        youtube_summary=LETS_PLAY_STUB,
+        youtube_summary_source="none",
+    )
+    video = YoutubeVideo(
+        video_id="abcdefghijk",
+        title="Crimson Moon Gameplay Let's Play",
+        duration_sec=600,
+        views=1000,
+    )
+    client = SimpleNamespace(
+        list_letsplays=AsyncMock(return_value=[video]),
+        fetch_transcript=AsyncMock(return_value=None),
+    )
+
+    async def _run():
+        with patch(
+            "app.services.youtube.whisper_letsplay_text",
+            new=AsyncMock(return_value=None),
+        ):
+            return await attach_letsplay(game, client, llm=SimpleNamespace())
+
+    changed = asyncio.run(_run())
+    assert changed is True
+    assert game.youtube_summary_source is None
+    assert game.youtube_summary is None
+    assert game.youtube_url is None
+
 
 

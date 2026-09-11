@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.llm.client import groq_transcriptions_url
+from app.llm.client import groq_transcriptions_url, whisper_upload_name
 from app.services.yt_audio import (
     _AUDIO_FORMAT,
     _pick_output,
@@ -22,6 +22,16 @@ def test_groq_transcriptions_url_from_chat_completions():
         == "https://api.groq.com/openai/v1/audio/transcriptions"
     )
     assert groq_transcriptions_url("") == "https://api.groq.com/openai/v1/audio/transcriptions"
+
+
+def test_whisper_upload_name_maps_opus_not_octet_stream():
+    from app.llm.client import _audio_mime
+
+    assert whisper_upload_name("chunk.opus") == "chunk.ogg"
+    assert whisper_upload_name("chunk.webm") == "chunk.webm"
+    assert whisper_upload_name("chunk.unknown") == "chunk.wav"
+    assert _audio_mime("chunk.opus") == "audio/ogg"
+    assert _audio_mime("chunk.bin") == "audio/wav"
 
 
 def test_audio_windows_short_vs_long():

@@ -13,6 +13,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 WHISPER_MAX_BYTES = 25 * 1024 * 1024
+WHISPER_CONVERT_MIN_BYTES = 8 * 1024
 PLAYER_CLIENTS = ("tv_embedded", "web", "android")
 _BOT_MARKERS = (
     "sign in to confirm",
@@ -75,6 +76,39 @@ def ffmpeg_path() -> str | None:
 
 def _has_ffmpeg() -> bool:
     return ffmpeg_path() is not None
+
+
+def prepare_whisper_audio(src: Path, *, timeout: float = 60.0) -> Path:
+    """WAV 16 kHz mono: Groq часто отвечает 400 на opus/webm и кривые контейнеры."""
+    if not src.is_file() or src.stat().st_size <= 0:
+        return src
+    if src.stat().st_size < WHISPER_CONVERT_MIN_BYTES:
+        return src
+    ffmpeg = ffmpeg_path()
+    if not ffmpeg:
+        return src
+    dest = src.with_name(f"{src.stem}_groq.wav")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(dest),
+    ]
+    code, stderr = _run_ytdlp_sync(cmd, timeout)
+    if code == 0 and dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    logger.warning("ffmpeg→wav %s: %s %s", src.name, code, (stderr or "")[-200:])
+    return src
 
 
 def _ytdlp_cmd(

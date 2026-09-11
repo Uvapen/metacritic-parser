@@ -1120,6 +1120,7 @@ async def enqueue_enrichment(
     slugs: list[str],
     *,
     kinds: tuple[str, ...] | list[str] = ENRICHMENT_KINDS,
+    force_youtube: bool = False,
 ) -> int:
     """Ставит similar/youtube на slug, если такой задачи ещё нет в полёте."""
     if not int(run_id or 0):
@@ -1151,7 +1152,9 @@ async def enqueue_enrichment(
                     continue
                 if kind == JOB_YOUTUBE:
                     game = by_slug.get(slug)
-                    if game is not None and not needs_letsplay_job(game):
+                    if game is not None and not needs_letsplay_job(
+                        game, force=force_youtube
+                    ):
                         continue
                 session.add(
                     PipelineJob(
@@ -1175,7 +1178,7 @@ async def enqueue_enrichment(
     return added
 
 
-async def _youtube_hole_slugs(limit: int) -> list[str]:
+async def _youtube_hole_slugs(limit: int, *, include_stubs: bool = False) -> list[str]:
     cap = max(0, int(limit or 0))
     if not cap:
         return []
@@ -1186,7 +1189,8 @@ async def _youtube_hole_slugs(limit: int) -> list[str]:
         )
         for slug, summary, source in rows.all():
             if not needs_letsplay_job(
-                SimpleNamespace(youtube_summary=summary, youtube_summary_source=source)
+                SimpleNamespace(youtube_summary=summary, youtube_summary_source=source),
+                force=include_stubs,
             ):
                 continue
             slugs.append(slug)
@@ -1352,13 +1356,13 @@ async def run_similar_now() -> int | None:
 
 
 async def run_youtube_now() -> int | None:
-    """Кнопка: летсплеи последнего прогона + дырки без Groq-заключения."""
+    """Кнопка: летсплеи последнего прогона + дырки, включая заглушки после сбоя Whisper."""
     settings = get_settings()
     run_id, slugs = await last_run_slugs()
-    holes = await _youtube_hole_slugs(settings.youtube_backfill_limit)
+    holes = await _youtube_hole_slugs(settings.youtube_backfill_limit, include_stubs=True)
     merged = list(dict.fromkeys([*slugs, *holes]))
     logger.info("Ручной этап YouTube run=%s, игр %s", run_id, len(merged))
-    await enqueue_enrichment(run_id, merged, kinds=(JOB_YOUTUBE,))
+    await enqueue_enrichment(run_id, merged, kinds=(JOB_YOUTUBE,), force_youtube=True)
     return await drain_kind(JOB_YOUTUBE)
 
 

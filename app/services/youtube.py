@@ -19,7 +19,7 @@ from sqlalchemy import or_, select
 from app.config import Settings, get_settings
 from app.db import SessionLocal
 from app.models import Game
-from app.services.yt_audio import download_letsplay_audio, download_letsplay_captions
+from app.services.yt_audio import download_letsplay_audio, download_letsplay_captions, prepare_whisper_audio
 
 logger = logging.getLogger(__name__)
 
@@ -750,7 +750,7 @@ def sample_transcript(
         return ""
     total = float(duration_sec or cues[-1].start or 0)
     if total <= 45 * 60:
-        return _clip_chars(" ".join(cue.text for cue in cues), limit)
+        return _clip_chars(collapse_rolling_caption_text(cues), limit)
     window = 10 * 60
     mid = total / 2
     spans = (
@@ -760,10 +760,30 @@ def sample_transcript(
     )
     parts: list[str] = []
     for start, end in spans:
-        chunk = " ".join(cue.text for cue in cues if start <= cue.start < end)
+        chunk = collapse_rolling_caption_text(
+            [cue for cue in cues if start <= cue.start < end]
+        )
         if chunk:
             parts.append(chunk)
     return _clip_chars(" … ".join(parts), limit)
+
+
+def collapse_rolling_caption_text(cues: list[CaptionCue] | Iterable[CaptionCue]) -> str:
+    """Убирает эхо автосубтитров YouTube: каждая фраза повторяется 2–3 раза."""
+    words_out: list[str] = []
+    prev: list[str] = []
+    for cue in cues:
+        words = (getattr(cue, "text", None) or str(cue) or "").split()
+        if not words:
+            continue
+        overlap = 0
+        for count in range(min(len(words), len(prev)), 0, -1):
+            if prev[-count:] == words[:count]:
+                overlap = count
+                break
+        words_out.extend(words[overlap:])
+        prev = words
+    return " ".join(words_out)
 
 
 def pick_caption_track(tracks: list[dict[str, Any]]) -> str | None:
@@ -871,10 +891,16 @@ def letsplay_has_summary(game: Any) -> bool:
     return True
 
 
-def needs_letsplay_job(game: Any) -> bool:
-    """True, пока нет саммари по субтитрам/Whisper. Старая заглушка «субтитры» — перепрос."""
+def needs_letsplay_job(game: Any, *, force: bool = False) -> bool:
+    """True, пока нет саммари по субтитрам/Whisper. Старая заглушка «субтитры» — перепрос.
+
+    force: кнопка «Запустить летсплеи» заново берёт и честные заглушки
+    (Whisper 400 / антибот не должны навсегда закрывать карточку).
+    """
     if letsplay_has_summary(game):
         return False
+    if force:
+        return True
     source = getattr(game, "youtube_summary_source", None)
     summary = " ".join((getattr(game, "youtube_summary", None) or "").split())
     if source == "none":
@@ -916,6 +942,17 @@ def apply_letsplay_stub(game: Game) -> bool:
     return changed
 
 
+def clear_letsplay_attempt(game: Game) -> None:
+    """Сброс ролика без заглушки: техсбой (Whisper 400, антибот) — карточку ещё разберём."""
+    game.youtube_url = None
+    game.youtube_title = None
+    game.youtube_channel = None
+    game.youtube_views = None
+    game.youtube_duration_sec = None
+    game.youtube_kind = None
+    game.youtube_transcript_sample = None
+
+
 async def whisper_letsplay_text(
     video_id: str,
     *,
@@ -937,21 +974,26 @@ async def whisper_letsplay_text(
             return None
         logger.info("Whisper: %s → %s", video_id, [path.name for path in paths])
         parts: list[str] = []
+        had_error = False
         for path in paths:
             if path.suffix.lower() == ".part" or ".part" in path.suffixes:
                 continue
+            ready = prepare_whisper_audio(path)
             result = await llm.transcribe(
-                path.read_bytes(),
-                filename=path.name,
+                ready.read_bytes(),
+                filename=ready.name,
                 slug=slug,
                 kind="whisper",
             )
             if getattr(result, "error", None):
-                logger.warning("Whisper %s: %s", path.name, result.error)
+                had_error = True
+                logger.warning("Whisper %s: %s", ready.name, result.error)
             text = " ".join((result.text or "").split())
             if text:
                 parts.append(text)
         if not parts:
+            if had_error:
+                logger.warning("Whisper: нет текста для %s (ошибка API)", video_id)
             return None
         return _clip_chars(" … ".join(parts), 25_000)
     except Exception:
@@ -1060,17 +1102,27 @@ async def attach_letsplay(
     title = (game.title or game.slug or "").strip()
     if not title:
         return False
-    if not needs_letsplay_job(game):
+    if letsplay_has_summary(game):
         return False
+    if getattr(game, "youtube_summary_source", None) == "none":
+        game.youtube_summary = None
+        game.youtube_summary_source = None
+    search_failed = False
     try:
         videos = await client.list_letsplays(title)
     except Exception:
         logger.exception("Поиск летсплея сломался для %s", game.slug)
+        search_failed = True
         videos = []
     if not videos:
+        if search_failed:
+            clear_letsplay_attempt(game)
+            return True
         return apply_letsplay_stub(game)
     from app.llm.client import groq_chat_blocked
 
+    technical_block = False
+    saw_non_speech = False
     for video in videos:
         apply_letsplay(game, _hit_from_video(video))
         text = None
@@ -1082,6 +1134,7 @@ async def attach_letsplay(
             )
         except Exception:
             logger.exception("Субтитры не разобрались для %s", video.video_id)
+            technical_block = True
             text = None
         if not text:
             text = await whisper_letsplay_text(
@@ -1092,8 +1145,9 @@ async def attach_letsplay(
             )
             if text:
                 origin = "whisper"
-        if not text:
-            continue
+            else:
+                technical_block = True
+                continue
         status = await conclude_letsplay(
             game,
             client,
@@ -1110,7 +1164,17 @@ async def attach_letsplay(
                 game.slug,
             )
             return True
+        saw_non_speech = True
         logger.info("Летсплей %s без речи автора (%s), следующий ролик", game.slug, status)
+    if technical_block and not saw_non_speech:
+        logger.warning(
+            "Летсплей %s: нет текста из‑за субтитров/Whisper — заглушку не ставим",
+            game.slug,
+        )
+        clear_letsplay_attempt(game)
+        game.youtube_summary = None
+        game.youtube_summary_source = None
+        return True
     return apply_letsplay_stub(game)
 
 
@@ -1198,14 +1262,12 @@ async def process_letsplay_slug(
             game = await session.scalar(select(Game).where(Game.slug == slug))
             if game is None:
                 return False
-            if not needs_letsplay_job(game):
+            if letsplay_has_summary(game):
                 return True
             changed = await attach_letsplay(game, finder, llm=llm)
             if changed:
                 await session.commit()
-            if letsplay_has_summary(game) or getattr(game, "youtube_summary_source", None) == "none":
-                return True
-            return False
+            return True
     finally:
         if owns_client:
             await finder.__aexit__(None, None, None)

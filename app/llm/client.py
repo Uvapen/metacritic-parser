@@ -66,8 +66,12 @@ def classify_llm_http_error(exc: httpx.HTTPStatusError) -> tuple[str, int]:
     if 500 <= status <= 599:
         human = f"Ошибка сервера провайдера ({status})"
         return (f"{human}: {detail}" if detail else human), status
-    if status == 400 and detail:
-        return f"Некорректный запрос (400): {detail}", status
+    if status == 400:
+        return (
+            f"Некорректный запрос (400): {detail}"
+            if detail
+            else "Некорректный запрос (400): Whisper не принял аудиофайл"
+        ), status
     return (f"{exc}: {detail}" if detail else str(exc)), status
 
 
@@ -280,7 +284,9 @@ _AUDIO_MIME = {
     ".mp4": "audio/mp4",
     ".mpga": "audio/mpeg",
     ".mpeg": "audio/mpeg",
+    ".oga": "audio/ogg",
     ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
     ".wav": "audio/wav",
     ".webm": "audio/webm",
 }
@@ -295,9 +301,22 @@ def groq_transcriptions_url(chat_completions_url: str) -> str:
     return "https://api.groq.com/openai/v1/audio/transcriptions"
 
 
+def whisper_upload_name(filename: str) -> str:
+    """Имя с расширением, которое Groq умеет: opus → ogg, неизвестное → wav."""
+    name = Path(filename).name or "audio.wav"
+    if name.lower().endswith(".part"):
+        name = name[: -len(".part")]
+    suffix = Path(name).suffix.lower()
+    if suffix == ".opus":
+        return f"{Path(name).stem}.ogg"
+    if suffix in _AUDIO_MIME:
+        return name
+    return f"{Path(name).stem or 'audio'}.wav"
+
+
 def _audio_mime(filename: str) -> str:
-    suffix = Path(filename).suffix.lower()
-    return _AUDIO_MIME.get(suffix, "application/octet-stream")
+    suffix = Path(whisper_upload_name(filename)).suffix.lower()
+    return _AUDIO_MIME.get(suffix, "audio/wav")
 
 
 STUB_RESPONSE = (
@@ -721,13 +740,10 @@ class LLMClient:
     async def _post_transcription(self, audio: bytes, *, filename: str, model: str) -> str:
         timeout = float(getattr(self._settings, "whisper_timeout", None) or 180.0)
         headers = {"Authorization": f"Bearer {self._settings.llm_api_key}"}
-        name = Path(filename).name or "audio.mp3"
-        if name.lower().endswith(".part"):
-            name = name[: -len(".part")]
+        name = whisper_upload_name(filename)
         files = {"file": (name, audio, _audio_mime(name))}
         data = {
             "model": model,
-            "temperature": "0",
             "response_format": "json",
         }
         url = groq_transcriptions_url(self._settings.llm_api_url)
