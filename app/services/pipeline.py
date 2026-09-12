@@ -1477,13 +1477,20 @@ async def _finish_job(job_id: int, *, status: str, error: str | None = None) -> 
 
 
 async def _requeue_job(job_id: int) -> None:
+    """Снова в pending, но в хвост очереди: тот же id блокировал бы всех остальных."""
     async with SessionLocal() as session:
         job = await session.get(PipelineJob, job_id)
         if job is None:
             return
-        job.status = "pending"
-        job.finished_at = None
-        job.error_message = None
+        session.add(
+            PipelineJob(
+                run_id=job.run_id,
+                slug=job.slug,
+                kind=job.kind,
+                status="pending",
+            )
+        )
+        await session.delete(job)
         await session.commit()
 
 
@@ -1518,16 +1525,21 @@ async def _execute_job(job: dict[str, Any]) -> None:
 
 
 async def drain_one_job(*, kind: str | None = None, job_id: int | None = None) -> bool:
-    """Одна задача из очереди. Можно параллельно с hourly: Groq и так сериализуется."""
+    """Одна задача. Сначала летсплеи (поиск без Groq), похожие — если chat жив."""
     global _enriching
     if groq_chat_blocked() and kind == JOB_SIMILAR:
         return False
-    if groq_chat_blocked() and kind is None and job_id is None:
-        kind = JOB_YOUTUBE
     async with _enrich_lock:
         _enriching = True
         try:
-            job = await _pop_job(kind=kind, job_id=job_id)
+            if job_id is not None:
+                job = await _pop_job(kind=kind, job_id=job_id)
+            elif kind:
+                job = await _pop_job(kind=kind)
+            else:
+                job = await _pop_job(kind=JOB_YOUTUBE)
+                if job is None and not groq_chat_blocked():
+                    job = await _pop_job(kind=JOB_SIMILAR)
             if job is None:
                 return False
             if groq_chat_blocked() and job.get("kind") != JOB_YOUTUBE:

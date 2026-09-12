@@ -182,6 +182,28 @@ def test_tick_drains_youtube_when_groq_paused():
     groq_quota.reset()
 
 
+def test_tick_prefers_youtube_when_groq_ready():
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from app.llm.client import groq_quota
+    from app.services.pipeline import drain_one_job
+
+    groq_quota.reset()
+
+    async def _run():
+        with (
+            patch("app.services.pipeline._pop_job", new=AsyncMock()) as pop,
+            patch("app.services.pipeline._execute_job", new=AsyncMock()) as execute,
+        ):
+            pop.side_effect = [{"id": 3, "kind": "youtube", "slug": "valheim", "run_id": 1}]
+            assert await drain_one_job() is True
+            pop.assert_awaited_once_with(kind="youtube")
+            execute.assert_awaited_once()
+
+    asyncio.run(_run())
+
+
 def test_deep_diff_flags_reviews_when_quotes_change():
     old = [SimpleNamespace(quote="old take", score=80)]
     new = [SimpleNamespace(quote="new take", score=80)]

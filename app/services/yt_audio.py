@@ -16,7 +16,11 @@ logger = logging.getLogger(__name__)
 
 WHISPER_MAX_BYTES = 25 * 1024 * 1024
 WHISPER_CONVERT_MIN_BYTES = 8 * 1024
-PLAYER_CLIENTS = ("android_vr", "tv_embedded", "web", "android")
+PLAYER_CLIENTS = ("android", "android_vr", "ios", "mweb", "tv_embedded", "web")
+_AUDIO_FORMAT = (
+    "bestaudio[vcodec=none]/bestaudio[ext=m4a]/bestaudio[ext=webm]"
+    "/140/251/250/249/18/bestaudio/ba"
+)
 _BOT_MARKERS = (
     "sign in to confirm",
     "not a bot",
@@ -25,10 +29,6 @@ _BOT_MARKERS = (
 )
 _SKIP_SUFFIXES = {".part", ".ytdl", ".tmp", ".temp"}
 _AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".opus", ".wav", ".webm"}
-_AUDIO_FORMAT = (
-    "bestaudio[vcodec=none]/bestaudio[ext=m4a]/bestaudio[ext=webm]"
-    "/140/251/250/249/bestaudio/ba"
-)
 _CREATE_NO_WINDOW = 0x08000000
 
 
@@ -113,6 +113,54 @@ def prepare_whisper_audio(src: Path, *, timeout: float = 60.0) -> Path:
     return src
 
 
+def fit_whisper_audio(src: Path, *, timeout: float = 90.0) -> Path | None:
+    """Уложить файл в лимит Groq 25 МБ: WAV 16 kHz, при необходимости первые 10 минут."""
+    if not src.is_file() or src.stat().st_size <= 0:
+        return None
+    if src.stat().st_size <= WHISPER_MAX_BYTES:
+        return src
+    ready = prepare_whisper_audio(src, timeout=timeout)
+    if ready.is_file() and 0 < ready.stat().st_size <= WHISPER_MAX_BYTES:
+        return ready
+    ffmpeg = ffmpeg_path()
+    if not ffmpeg:
+        logger.warning("Аудио %s больше 25 МБ (%s), пропуск", src.name, src.stat().st_size)
+        return None
+    dest = src.with_name(f"{src.stem}_groq10.wav")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-t",
+        "600",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(dest),
+    ]
+    code, stderr = _run_ytdlp_sync(cmd, timeout)
+    if code == 0 and dest.is_file() and 0 < dest.stat().st_size <= WHISPER_MAX_BYTES:
+        return dest
+    logger.warning("Аудио %s больше 25 МБ (%s), пропуск", src.name, src.stat().st_size)
+    if stderr:
+        logger.warning("ffmpeg trim %s: %s %s", src.name, code, stderr[-200:])
+    return None
+
+
+def _js_runtime_args() -> list[str]:
+    node = shutil.which("node")
+    if node:
+        return ["--js-runtimes", f"node:{node}"]
+    return []
+
+
 def _ytdlp_cmd(
     url: str,
     outtmpl: str,
@@ -137,6 +185,7 @@ def _ytdlp_cmd(
         "-o",
         outtmpl,
     ]
+    cmd.extend(_js_runtime_args())
     # Без -x: imageio-ffmpeg на Windows падает на mp3, а Groq Whisper ест webm/m4a.
     cmd.extend(["-f", _AUDIO_FORMAT])
     if ffmpeg:
@@ -253,6 +302,7 @@ async def search_youtube_ytdlp(
         "-J",
         f"ytsearch{n}:{q}",
     ]
+    cmd.extend(_js_runtime_args())
     code, stdout, stderr = await asyncio.to_thread(_run_ytdlp_stdout_sync, cmd, timeout)
     videos = parse_ytdlp_search_json(stdout)
     if videos:
@@ -276,11 +326,11 @@ def _pick_output(folder: Path, stem: str) -> Path | None:
     found = [path for path in folder.glob(f"{stem}.*") if _is_ready_audio(path)]
     if not found:
         return None
-    chosen = max(found, key=lambda item: item.stat().st_size)
-    if chosen.stat().st_size > WHISPER_MAX_BYTES:
-        logger.warning("Аудио %s больше 25 МБ (%s), пропуск", chosen.name, chosen.stat().st_size)
-        return None
-    return chosen
+    under = [path for path in found if path.stat().st_size <= WHISPER_MAX_BYTES]
+    if under:
+        return max(under, key=lambda item: item.stat().st_size)
+    candidate = min(found, key=lambda item: item.stat().st_size)
+    return fit_whisper_audio(candidate)
 
 
 def _caption_rank(path: Path) -> tuple[int, int]:
@@ -328,6 +378,7 @@ def _ytdlp_captions_cmd(url: str, outtmpl: str, player_client: str | None) -> li
         "-o",
         outtmpl,
     ]
+    cmd.extend(_js_runtime_args())
     if player_client:
         cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
     ffmpeg = ffmpeg_path()
@@ -345,7 +396,7 @@ async def download_letsplay_captions(video_id: str, dest_dir: Path, *, timeout: 
     dest_dir.mkdir(parents=True, exist_ok=True)
     url = f"https://www.youtube.com/watch?v={video_id}"
     outtmpl = str(dest_dir / f"{video_id}.%(ext)s")
-    for client in ("android_vr", None):
+    for client in (*PLAYER_CLIENTS, None):
         code, stderr = await _run_ytdlp(_ytdlp_captions_cmd(url, outtmpl, client), timeout)
         path = _pick_caption(dest_dir, video_id)
         if path is not None:

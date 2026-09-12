@@ -1077,6 +1077,17 @@ async def whisper_letsplay_text(
         paths = await download_letsplay_audio(video_id, dest, duration_sec=duration_sec)
         if not paths:
             logger.info("Whisper: нет аудио для %s", video_id)
+            if hasattr(llm, "note"):
+                try:
+                    await llm.note(
+                        prompt=f"[whisper {video_id}]",
+                        error="Whisper не запустился: yt-dlp не скачал аудио (бот-стена или таймаут)",
+                        slug=slug,
+                        kind="whisper",
+                        model=str(getattr(settings, "whisper_model", None) or "whisper-large-v3-turbo"),
+                    )
+                except Exception:
+                    logger.exception("Не записали whisper-заметку для %s", video_id)
             return None
         logger.info("Whisper: %s → %s", video_id, [path.name for path in paths])
         parts: list[str] = []
@@ -1214,13 +1225,14 @@ async def attach_letsplay(
         game.youtube_summary = None
         game.youtube_summary_source = None
 
-    async def _trace(message: str) -> None:
+    async def _trace(message: str, *, failed: bool = False) -> None:
         if llm is None or not hasattr(llm, "note"):
             return
         try:
             await llm.note(
                 prompt=f"[youtube search] {title}",
-                response=message,
+                error=message if failed else None,
+                response="" if failed else message,
                 slug=getattr(game, "slug", None),
                 kind="youtube",
             )
@@ -1240,7 +1252,7 @@ async def attach_letsplay(
     if not videos:
         found = int(getattr(client, "last_search_count", 0) or 0)
         if search_failed:
-            await _trace("Поиск YouTube упал с ошибкой")
+            await _trace("Поиск YouTube упал с ошибкой", failed=True)
             clear_letsplay_attempt(game)
             return False
         await _trace(
@@ -1291,19 +1303,19 @@ async def attach_letsplay(
             return True
         if status == "llm_error" or groq_chat_blocked():
             logger.warning(
-                "Летсплей %s найден, саммари Groq нет — карточку не заглушаем, повторим",
+                "Летсплей %s найден, саммари Groq нет — карточку не заглушаем",
                 game.slug,
             )
-            return False
+            return letsplay_has_video(game)
         saw_non_speech = True
         logger.info("Летсплей %s без речи автора (%s), следующий ролик", game.slug, status)
     if technical_block and not saw_non_speech:
         logger.warning(
-            "Летсплей %s: нет текста из‑за субтитров/Whisper — заглушку не ставим, повторим",
+            "Летсплей %s: нет текста из‑за субтитров/Whisper — заглушку не ставим",
             game.slug,
         )
-        await _trace("Ролик найден, но субтитры и Whisper не дали текст")
-        return False
+        await _trace("Ролик найден, но субтитры и Whisper не дали текст", failed=True)
+        return letsplay_has_video(game)
     return apply_letsplay_stub(game)
 
 
@@ -1395,7 +1407,7 @@ async def process_letsplay_slug(
                 return True
             done = await attach_letsplay(game, finder, llm=llm)
             await session.commit()
-            return bool(done)
+            return bool(done) or letsplay_has_video(game)
     finally:
         if owns_client:
             await finder.__aexit__(None, None, None)

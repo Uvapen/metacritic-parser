@@ -628,7 +628,7 @@ class LLMClient:
             model=model,
             stub=True,
             latency_ms=0,
-            error=None,
+            error=(error or "").strip() or None,
             kind=kind,
         )
         if not result.text:

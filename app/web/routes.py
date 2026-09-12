@@ -155,11 +155,11 @@ def action_ru(value: str | None) -> str:
 
 
 def llm_row_status(item: Any) -> str:
-    if isinstance(item, dict) and (item.get("note") or _is_llm_note(item)):
+    if not isinstance(item, dict) or not item.get("ok"):
+        return "ошибка"
+    if item.get("note") or _is_llm_note(item):
         return "заметка"
-    if isinstance(item, dict) and item.get("ok"):
-        return "успех"
-    return "ошибка"
+    return "успех"
 
 
 def status_ru(value: str | None, run_id: Any = None) -> str:
@@ -351,7 +351,7 @@ def _llm_ok_by_id_for_run(run_id: int, runs: list[Any] | None = None) -> dict[in
             continue
         if _bind_llm_run_id(_coerce_int(item.get("run_id")), _llm_game_slug(item), item.get("ts"), runs) != run_id:
             continue
-        mapping[line_no] = True if _is_llm_note(item) else bool(item.get("ok"))
+        mapping[line_no] = _llm_item_ok(item)
     return mapping
 
 
@@ -374,7 +374,7 @@ def _llm_entries_by_slug_for_run(run_id: int, runs: list[Any] | None = None) -> 
             {
                 "id": line_no,
                 "kind": str(item.get("kind") or ""),
-                "ok": True if _is_llm_note(item) else bool(item.get("ok")),
+                "ok": _llm_item_ok(item),
             }
         )
     return mapping
@@ -390,6 +390,17 @@ def _llm_ids_by_slug_for_run(run_id: int) -> dict[str, list[int]]:
 def _is_llm_note(item: dict[str, Any]) -> bool:
     """Заметка без HTTP Groq: поиск YouTube или похожие-эвристика."""
     return str(item.get("model") or "") in LLM_NOTE_MODELS
+
+
+def _llm_item_ok(item: dict[str, Any]) -> bool:
+    """YouTube-заметка с error — это сбой, не успех."""
+    if str(item.get("error") or "").strip():
+        return False
+    if item.get("ok") is False:
+        return False
+    if _is_llm_note(item):
+        return True
+    return bool(item.get("ok"))
 
 
 def _llm_jsonl_stats_for_run(run_id: int, runs: list[Any] | None = None) -> tuple[int, int, int]:
@@ -778,7 +789,7 @@ def _collect_llm_records(
         if model_name:
             models.add(str(model_name))
         is_note = _is_llm_note(item)
-        is_ok = True if is_note else bool(item.get("ok"))
+        is_ok = _llm_item_ok(item)
         attempt = _coerce_int(item.get("attempt")) or 1
         rec_kind = str(item.get("kind") or "")
         if rec_kind:
@@ -939,11 +950,12 @@ def _read_llm_record(log_id: int, runs: list[Any] | None = None) -> dict[str, An
             except (TypeError, ValueError):
                 status_int = None
             is_note = _is_llm_note(item)
+            is_ok = _llm_item_ok(item)
             return {
                 "id": log_id,
                 "ts": item.get("ts"),
                 "model": item.get("model"),
-                "ok": True if is_note else bool(item.get("ok")),
+                "ok": is_ok,
                 "stub": item.get("stub") or is_note,
                 "note": is_note,
                 "latency_ms": item.get("latency_ms"),
@@ -956,8 +968,8 @@ def _read_llm_record(log_id: int, runs: list[Any] | None = None) -> dict[str, An
                 "origin_href": _llm_table_href(origin_id, rec_run_id) if origin_id else "",
                 "system": item.get("system") or "",
                 "prompt": item.get("prompt") or "",
-                "response": item.get("response") or (item.get("error") if is_note else "") or "",
-                "error": "" if is_note else humanize_llm_error(item.get("error"), status_int),
+                "response": item.get("response") or "",
+                "error": "" if is_ok else humanize_llm_error(item.get("error"), status_int),
                 "error_status": status_int,
             }
     return None

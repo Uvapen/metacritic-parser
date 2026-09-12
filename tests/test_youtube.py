@@ -476,7 +476,7 @@ def test_attach_does_not_stub_when_whisper_fails():
             return await attach_letsplay(game, client, llm=SimpleNamespace())
 
     changed = asyncio.run(_run())
-    assert changed is False
+    assert changed is True
     assert game.youtube_summary_source != "none"
     assert game.youtube_summary != LETS_PLAY_STUB
     assert game.youtube_url == "https://www.youtube.com/watch?v=abcdefghijk"
@@ -516,7 +516,7 @@ def test_attach_keeps_saved_video_when_search_empty():
             return await attach_letsplay(game, client, llm=SimpleNamespace())
 
     changed = asyncio.run(_run())
-    assert changed is False
+    assert changed is True
     assert game.youtube_summary != LETS_PLAY_STUB
     assert game.youtube_url == "https://www.youtube.com/watch?v=abcdefghijk"
 

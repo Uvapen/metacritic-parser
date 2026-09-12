@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.llm.client import groq_transcriptions_url, whisper_upload_name
 from app.services.yt_audio import (
+    WHISPER_MAX_BYTES,
     _AUDIO_FORMAT,
     _pick_output,
     _ytdlp_cmd,
@@ -71,6 +72,30 @@ def test_pick_output_skips_partial_downloads(tmp_path: Path):
     assert not youtube_download_blocked("Downloading audio")
 
 
+def test_pick_output_prefers_file_under_whisper_limit(tmp_path: Path):
+    oversized = tmp_path / "abc_0.mp4"
+    compact = tmp_path / "abc_0.m4a"
+    oversized.write_bytes(b"x" * (WHISPER_MAX_BYTES + 200))
+    compact.write_bytes(b"y" * 8000)
+    assert _pick_output(tmp_path, "abc_0") == compact
+
+
+def test_pick_output_converts_oversized_download(tmp_path: Path):
+    from app.services import yt_audio
+
+    oversized = tmp_path / "abc_0.mp4"
+    oversized.write_bytes(b"x" * (WHISPER_MAX_BYTES + 200))
+    fitted = tmp_path / "abc_0_groq.wav"
+    fitted.write_bytes(b"y" * 4000)
+
+    def _fake_fit(src: Path, *, timeout: float = 90.0) -> Path | None:
+        assert src == oversized
+        return fitted
+
+    with patch.object(yt_audio, "fit_whisper_audio", _fake_fit):
+        assert yt_audio._pick_output(tmp_path, "abc_0") == fitted
+
+
 def test_pick_caption_prefers_russian(tmp_path: Path):
     from app.services.yt_audio import _pick_caption
 
@@ -119,3 +144,34 @@ def test_whisper_letsplay_joins_chunks(tmp_path: Path):
     assert "intro combat" in text
     assert "boss fight" in text
     assert llm.transcribe.await_count == 2
+
+
+def test_whisper_logs_when_audio_missing(tmp_path: Path):
+    llm = SimpleNamespace(transcribe=AsyncMock(), note=AsyncMock(return_value=1))
+
+    async def _run():
+        with (
+            patch("app.services.youtube.get_settings") as settings,
+            patch(
+                "app.services.youtube.download_letsplay_audio",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            settings.return_value = SimpleNamespace(
+                whisper_enabled=True,
+                whisper_model="whisper-large-v3-turbo",
+                data_dir=tmp_path,
+            )
+            return await whisper_letsplay_text(
+                "abcdefghijk",
+                duration_sec=600,
+                llm=llm,
+                slug="valheim",
+            )
+
+    assert asyncio.run(_run()) is None
+    assert llm.transcribe.await_count == 0
+    llm.note.assert_awaited()
+    kwargs = llm.note.await_args.kwargs
+    assert kwargs["kind"] == "whisper"
+    assert "не скачал аудио" in kwargs["error"]

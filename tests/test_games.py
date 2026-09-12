@@ -37,14 +37,25 @@ def test_youtube_search_notes_are_not_llm_errors(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(web_routes, "get_settings", lambda: settings)
     assert _is_llm_note({"model": "youtube"}) is True
-    assert llm_row_status({"model": "youtube", "ok": False, "note": True}) == "заметка"
+    assert llm_row_status({"model": "youtube", "ok": True, "note": True}) == "заметка"
+    assert (
+        llm_row_status(
+            {
+                "model": "youtube",
+                "ok": False,
+                "note": True,
+                "error": "Ролик найден, но субтитры и Whisper не дали текст",
+            }
+        )
+        == "ошибка"
+    )
     calls, _retries, fails = web_routes._llm_jsonl_stats_for_run(3)
     assert calls == 1
     assert fails == 1
     records, _models, _kinds = web_routes._collect_llm_records()
-    notes = [item for item in records if item.get("note")]
-    assert notes and notes[0]["ok"] is True
-    assert notes[0]["error"].startswith("Поиск YouTube")
+    youtube_rows = [item for item in records if item.get("model") == "youtube"]
+    assert youtube_rows and youtube_rows[0]["ok"] is False
+    assert youtube_rows[0]["error"].startswith("Поиск YouTube")
 
 
 def test_llm_monitor_filters_include_fallback_model_and_tags(tmp_path, monkeypatch):
