@@ -17,6 +17,36 @@ def test_status_ru_includes_run_number():
     assert status_ru("success") == "успех"
 
 
+def test_youtube_search_notes_are_not_llm_errors(tmp_path, monkeypatch):
+    from app.web.routes import _is_llm_note, llm_row_status
+
+    log_path = tmp_path / "llm_logs.jsonl"
+    log_path.write_text(
+        '{"ts":"2026-09-12T01:00:00+00:00","model":"youtube","ok":false,'
+        '"kind":"youtube","run_id":3,"error":"Поиск YouTube не вернул летсплей",'
+        '"game_slug":"nba-2k27"}\n'
+        '{"ts":"2026-09-12T01:01:00+00:00","model":"openai/gpt-oss-20b","ok":false,'
+        '"kind":"youtube","run_id":3,"error":"429"}\n',
+        encoding="utf-8",
+    )
+    settings = SimpleNamespace(
+        llm_model="openai/gpt-oss-120b",
+        llm_fallback_models="openai/gpt-oss-20b",
+        whisper_model="whisper-large-v3-turbo",
+        llm_log_path=log_path,
+    )
+    monkeypatch.setattr(web_routes, "get_settings", lambda: settings)
+    assert _is_llm_note({"model": "youtube"}) is True
+    assert llm_row_status({"model": "youtube", "ok": False, "note": True}) == "заметка"
+    calls, _retries, fails = web_routes._llm_jsonl_stats_for_run(3)
+    assert calls == 1
+    assert fails == 1
+    records, _models, _kinds = web_routes._collect_llm_records()
+    notes = [item for item in records if item.get("note")]
+    assert notes and notes[0]["ok"] is True
+    assert notes[0]["error"].startswith("Поиск YouTube")
+
+
 def test_llm_monitor_filters_include_fallback_model_and_tags(tmp_path, monkeypatch):
     log_path = tmp_path / "llm_logs.jsonl"
     settings = SimpleNamespace(

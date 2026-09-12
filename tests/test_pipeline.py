@@ -166,19 +166,19 @@ def test_chat_fallback_chain_and_quota_pause():
     assert groq_quota.chat_ready() is True
 
 
-def test_tick_skips_when_groq_paused():
+def test_tick_drains_youtube_when_groq_paused():
     import asyncio
     import time
     from unittest.mock import AsyncMock, patch
 
     from app.llm.client import groq_quota
-    from app.services.pipeline import tick_pipeline_stages
+    from app.services.pipeline import JOB_YOUTUBE, tick_pipeline_stages
 
     groq_quota.reset()
     groq_quota.chat_paused_until = time.monotonic() + 120
     with patch("app.services.pipeline.drain_one_job", new=AsyncMock()) as drain:
         asyncio.run(tick_pipeline_stages())
-        drain.assert_not_called()
+        drain.assert_awaited_once_with(kind=JOB_YOUTUBE)
     groq_quota.reset()
 
 

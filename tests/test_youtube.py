@@ -406,6 +406,21 @@ def test_collapse_rolling_youtube_asr():
     assert sampled.count("С момента создания этого канала") == 1
 
 
+def test_letsplay_video_is_ready_without_summary():
+    from types import SimpleNamespace
+
+    from app.services.youtube import letsplay_has_summary, letsplay_has_video
+
+    game = SimpleNamespace(
+        youtube_url="https://www.youtube.com/watch?v=5X-YA8QjbeY",
+        youtube_summary=None,
+        youtube_summary_source=None,
+    )
+    assert letsplay_has_video(game) is True
+    assert letsplay_has_summary(game) is False
+    assert letsplay_has_video(SimpleNamespace(youtube_url=None)) is False
+
+
 def test_groq_letsplay_summary_is_shown_on_card():
     from types import SimpleNamespace
 
@@ -461,10 +476,49 @@ def test_attach_does_not_stub_when_whisper_fails():
             return await attach_letsplay(game, client, llm=SimpleNamespace())
 
     changed = asyncio.run(_run())
-    assert changed is True
-    assert game.youtube_summary_source is None
-    assert game.youtube_summary is None
-    assert game.youtube_url is None
+    assert changed is False
+    assert game.youtube_summary_source != "none"
+    assert game.youtube_summary != LETS_PLAY_STUB
+    assert game.youtube_url == "https://www.youtube.com/watch?v=abcdefghijk"
+
+
+def test_attach_keeps_saved_video_when_search_empty():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from app.services.youtube import LETS_PLAY_STUB, attach_letsplay
+
+    game = SimpleNamespace(
+        slug="crimson-moon",
+        title="Crimson Moon",
+        youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        youtube_title="Crimson Moon Gameplay Let's Play",
+        youtube_channel="ch",
+        youtube_views=1000,
+        youtube_duration_sec=600,
+        youtube_kind="letsplay",
+        youtube_transcript_sample=None,
+        youtube_summary=None,
+        youtube_summary_source=None,
+    )
+    client = SimpleNamespace(
+        last_search_count=0,
+        list_letsplays=AsyncMock(return_value=[]),
+        fetch_transcript=AsyncMock(return_value=None),
+    )
+
+    async def _run():
+        with patch(
+            "app.services.youtube.whisper_letsplay_text",
+            new=AsyncMock(return_value=None),
+        ):
+            return await attach_letsplay(game, client, llm=SimpleNamespace())
+
+    changed = asyncio.run(_run())
+    assert changed is False
+    assert game.youtube_summary != LETS_PLAY_STUB
+    assert game.youtube_url == "https://www.youtube.com/watch?v=abcdefghijk"
 
 
 def test_long_title_match_without_gameplay_word_is_letsplay():
@@ -478,6 +532,21 @@ def test_long_title_match_without_gameplay_word_is_letsplay():
     )
     assert classify_youtube_video("Valheim", video) == "letsplay"
     assert choose_letsplay("Valheim", [video]) is video
+
+
+def test_title_match_without_duration_is_letsplay():
+    from app.services.youtube import YoutubeVideo, classify_youtube_video, choose_letsplay
+
+    video = YoutubeVideo(
+        video_id="valheimflat1",
+        title="Valheim — First Night in the Tenth World",
+    )
+    assert classify_youtube_video("Valheim", video) == "letsplay"
+    assert choose_letsplay("Valheim", [video]) is video
+    trailer = YoutubeVideo(video_id="valheimtrai", title="Valheim Launch Trailer")
+    assert classify_youtube_video("Valheim", trailer) is None
+    shorts = YoutubeVideo(video_id="valheimshrt", title="Valheim Shorts")
+    assert classify_youtube_video("Valheim", shorts) is None
 
 
 def test_parse_ytdlp_search_json_reads_entries():

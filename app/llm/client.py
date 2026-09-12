@@ -626,11 +626,13 @@ class LLMClient:
         result = LLMResult(
             text=response,
             model=model,
-            stub=bool(response) and error is None,
+            stub=True,
             latency_ms=0,
-            error=error,
+            error=None,
             kind=kind,
         )
+        if not result.text:
+            result.text = (error or "").strip()
         result.log_id = await self._append_log(
             prompt=prompt,
             system=None,

@@ -1428,11 +1428,29 @@ async def recover_followups_on_startup() -> None:
     await recover_enrichment_on_startup()
 
 
-async def _pop_job(kind: str | None = None) -> dict[str, Any] | None:
+async def _pending_job_ids(kind: str) -> list[int]:
     async with SessionLocal() as session:
-        stmt = select(PipelineJob).where(PipelineJob.status == "pending").order_by(PipelineJob.id)
-        if kind:
-            stmt = stmt.where(PipelineJob.kind == kind)
+        rows = await session.scalars(
+            select(PipelineJob.id)
+            .where(PipelineJob.status == "pending", PipelineJob.kind == kind)
+            .order_by(PipelineJob.id)
+        )
+        return [int(item) for item in rows.all()]
+
+
+async def _pop_job(
+    kind: str | None = None,
+    *,
+    job_id: int | None = None,
+) -> dict[str, Any] | None:
+    async with SessionLocal() as session:
+        stmt = select(PipelineJob).where(PipelineJob.status == "pending")
+        if job_id is not None:
+            stmt = stmt.where(PipelineJob.id == int(job_id))
+        else:
+            stmt = stmt.order_by(PipelineJob.id)
+            if kind:
+                stmt = stmt.where(PipelineJob.kind == kind)
         job = await session.scalar(stmt.limit(1))
         if job is None:
             return None
@@ -1499,16 +1517,21 @@ async def _execute_job(job: dict[str, Any]) -> None:
         await _finalize_run_if_idle(run_id)
 
 
-async def drain_one_job(*, kind: str | None = None) -> bool:
+async def drain_one_job(*, kind: str | None = None, job_id: int | None = None) -> bool:
     """Одна задача из очереди. Можно параллельно с hourly: Groq и так сериализуется."""
     global _enriching
-    if groq_chat_blocked():
+    if groq_chat_blocked() and kind == JOB_SIMILAR:
         return False
+    if groq_chat_blocked() and kind is None and job_id is None:
+        kind = JOB_YOUTUBE
     async with _enrich_lock:
         _enriching = True
         try:
-            job = await _pop_job(kind=kind)
+            job = await _pop_job(kind=kind, job_id=job_id)
             if job is None:
+                return False
+            if groq_chat_blocked() and job.get("kind") != JOB_YOUTUBE:
+                await _requeue_job(int(job["id"]))
                 return False
             await _execute_job(job)
             return True
@@ -1517,16 +1540,23 @@ async def drain_one_job(*, kind: str | None = None) -> bool:
 
 
 async def drain_kind(kind: str) -> int:
+    """Съедает текущий снимок очереди. Реqueue не крутит тот же id по кругу."""
+    ids = await _pending_job_ids(kind)
     done = 0
-    while await drain_one_job(kind=kind):
-        done += 1
+    for jid in ids:
+        if await drain_one_job(kind=kind, job_id=jid):
+            done += 1
     return done
 
 
 async def tick_pipeline_stages() -> None:
-    """Раз в ~20 с: одна similar или youtube. При суточном лимите Groq — пропуск."""
+    """Раз в ~20 с: одна similar или youtube. При суточном лимите Groq — только летсплеи."""
     if groq_chat_blocked():
-        logger.info("Очередь LLM на паузе Groq ещё %s с", int(groq_chat_retry_in()))
+        logger.info(
+            "Очередь LLM на паузе Groq ещё %s с — берём только летсплеи",
+            int(groq_chat_retry_in()),
+        )
+        await drain_one_job(kind=JOB_YOUTUBE)
         return
     await drain_one_job()
 

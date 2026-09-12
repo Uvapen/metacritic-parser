@@ -153,7 +153,7 @@
       </article>
       <article class="media-card">
         {% set yt_id = game.youtube_url|youtube_id %}
-        {% if game.youtube_url and yt_id and game is letsplay_ready %}
+        {% if game is letsplay_video and yt_id %}
           <button type="button" class="media-thumb" data-media-src="https://www.youtube.com/embed/{{ yt_id }}" aria-label="Смотреть летсплей">
             <img src="https://i.ytimg.com/vi/{{ yt_id }}/hqdefault.jpg" alt="">
             <span class="play">▶</span>
@@ -167,14 +167,18 @@
         {% endif %}
         <div class="body">
           <strong>Летсплей</strong>
-          {% if game is letsplay_ready and game.youtube_summary %}
+          {% if game is letsplay_video %}
             <p class="muted media-caption">
               {{ game.youtube_title or "YouTube" }}
               {% if game.youtube_channel %} · {{ game.youtube_channel }}{% endif %}
               {% if game.youtube_duration_sec %} · {{ game.youtube_duration_sec|yt_duration }}{% endif %}
               {% if game.youtube_views %} · {{ game.youtube_views|yt_views }} просмотров{% endif %}
             </p>
-            <p>{{ game.youtube_summary }}</p>
+            {% if game is letsplay_ready and game.youtube_summary %}
+              <p>{{ game.youtube_summary }}</p>
+            {% else %}
+              <p class="muted">саммари появится, когда Groq догонит</p>
+            {% endif %}
             {% if game.youtube_url %}
               <p><a href="{{ game.youtube_url }}" target="_blank" rel="noreferrer">Смотреть на YouTube</a></p>
             {% endif %}

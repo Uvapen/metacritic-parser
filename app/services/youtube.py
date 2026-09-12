@@ -15,6 +15,7 @@ from urllib.parse import quote_plus
 
 from curl_cffi.requests import AsyncSession
 from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import async_object_session
 
 from app.config import Settings, get_settings
 from app.db import SessionLocal
@@ -320,7 +321,11 @@ def classify_youtube_video(game_title: str, video: YoutubeVideo) -> str | None:
         return None
     if review:
         return "review"
-    if video.duration_sec is not None and video.duration_sec >= 8 * 60:
+    if video.duration_sec is None:
+        if _has_any(title, (" shorts", " #short", "short film")):
+            return None
+        return "letsplay"
+    if video.duration_sec >= 8 * 60:
         return "letsplay"
     return None
 
@@ -414,6 +419,7 @@ class YoutubeClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
         self._session: AsyncSession | None = None
+        self.last_search_count = 0
 
     async def __aenter__(self) -> YoutubeClient:
         self._session = AsyncSession(
@@ -462,9 +468,11 @@ class YoutubeClient:
             if classify_youtube_video(game_title, video) == "letsplay"
         ]
         if letsplays:
+            self.last_search_count = len(collected)
             return letsplays[:LETS_PLAY_PROBE_LIMIT]
         await _collect(_review_queries(game_title))
         ranked = rank_letsplay_candidates(game_title, collected)
+        self.last_search_count = len(collected)
         if ranked:
             logger.info(
                 "Летсплей %s: берём ярус обзора (%s)",
@@ -472,6 +480,11 @@ class YoutubeClient:
                 ranked[0].title,
             )
             return ranked[:LETS_PLAY_PROBE_LIMIT]
+        logger.info(
+            "Летсплей не найден: %s (собрали %s роликов, ни один не прошёл фильтр)",
+            game_title,
+            len(collected),
+        )
         return []
 
     async def find_letsplay(self, game_title: str) -> LetsPlayHit | None:
@@ -949,6 +962,23 @@ def letsplay_has_summary(game: Any) -> bool:
     return True
 
 
+def letsplay_has_video(game: Any) -> bool:
+    """Ролик можно показать, даже если Groq ещё не дал саммари."""
+    return bool(video_id_from_url(getattr(game, "youtube_url", None)))
+
+
+async def persist_letsplay_progress(game: Any) -> None:
+    """Сразу пишем URL в БД, чтобы карточка не ждала саммари Groq."""
+    try:
+        session = async_object_session(game)
+    except Exception:
+        return
+    if session is None:
+        return
+    await session.commit()
+    await session.refresh(game)
+
+
 def needs_letsplay_job(game: Any, *, force: bool = False) -> bool:
     """True, пока нет саммари по субтитрам/Whisper. Старая заглушка «субтитры» — перепрос.
 
@@ -966,7 +996,25 @@ def needs_letsplay_job(game: Any, *, force: bool = False) -> bool:
     return True
 
 
+def _video_from_game(game: Any) -> YoutubeVideo | None:
+    video_id = video_id_from_url(getattr(game, "youtube_url", None))
+    if not video_id:
+        return None
+    title = (getattr(game, "youtube_title", None) or getattr(game, "title", None) or video_id).strip()
+    return YoutubeVideo(
+        video_id=video_id,
+        title=title,
+        duration_sec=getattr(game, "youtube_duration_sec", None),
+        views=getattr(game, "youtube_views", None),
+        channel=getattr(game, "youtube_channel", None),
+    )
+
+
 def apply_letsplay(game: Game, hit: LetsPlayHit) -> None:
+    prev = video_id_from_url(getattr(game, "youtube_url", None))
+    nxt = video_id_from_url(hit.url)
+    if prev != nxt:
+        game.youtube_transcript_sample = None
     game.youtube_url = hit.url
     game.youtube_title = hit.title
     game.youtube_channel = hit.channel
@@ -1172,13 +1220,14 @@ async def attach_letsplay(
         try:
             await llm.note(
                 prompt=f"[youtube search] {title}",
-                error=message,
+                response=message,
                 slug=getattr(game, "slug", None),
                 kind="youtube",
             )
         except Exception:
             logger.exception("Не записали youtube-заметку для %s", getattr(game, "slug", None))
 
+    known = _video_from_game(game)
     search_failed = False
     try:
         videos = await client.list_letsplays(title)
@@ -1186,15 +1235,19 @@ async def attach_letsplay(
         logger.exception("Поиск летсплея сломался для %s", game.slug)
         search_failed = True
         videos = []
+    if known is not None:
+        videos = [known, *[item for item in videos if item.video_id != known.video_id]]
     if not videos:
-        await _trace(
-            "Поиск YouTube не вернул летсплей (Innertube/HTML пустые, yt-dlp тоже)"
-            if not search_failed
-            else "Поиск YouTube упал с ошибкой"
-        )
+        found = int(getattr(client, "last_search_count", 0) or 0)
         if search_failed:
+            await _trace("Поиск YouTube упал с ошибкой")
             clear_letsplay_attempt(game)
-            return True
+            return False
+        await _trace(
+            f"Поиск YouTube: {found} роликов, ни один не прошёл фильтр летсплея"
+            if found
+            else "Поиск YouTube не вернул ролики (Innertube/HTML пустые, yt-dlp тоже)"
+        )
         return apply_letsplay_stub(game)
     from app.llm.client import groq_chat_blocked
 
@@ -1202,6 +1255,7 @@ async def attach_letsplay(
     saw_non_speech = False
     for video in videos:
         apply_letsplay(game, _hit_from_video(video))
+        await persist_letsplay_progress(game)
         text = None
         origin = "transcript"
         try:
@@ -1237,22 +1291,19 @@ async def attach_letsplay(
             return True
         if status == "llm_error" or groq_chat_blocked():
             logger.warning(
-                "Летсплей %s найден, саммари Groq нет — карточку не заглушаем",
+                "Летсплей %s найден, саммари Groq нет — карточку не заглушаем, повторим",
                 game.slug,
             )
-            return True
+            return False
         saw_non_speech = True
         logger.info("Летсплей %s без речи автора (%s), следующий ролик", game.slug, status)
     if technical_block and not saw_non_speech:
         logger.warning(
-            "Летсплей %s: нет текста из‑за субтитров/Whisper — заглушку не ставим",
+            "Летсплей %s: нет текста из‑за субтитров/Whisper — заглушку не ставим, повторим",
             game.slug,
         )
         await _trace("Ролик найден, но субтитры и Whisper не дали текст")
-        clear_letsplay_attempt(game)
-        game.youtube_summary = None
-        game.youtube_summary_source = None
-        return True
+        return False
     return apply_letsplay_stub(game)
 
 
@@ -1342,10 +1393,9 @@ async def process_letsplay_slug(
                 return False
             if letsplay_has_summary(game):
                 return True
-            changed = await attach_letsplay(game, finder, llm=llm)
-            if changed:
-                await session.commit()
-            return True
+            done = await attach_letsplay(game, finder, llm=llm)
+            await session.commit()
+            return bool(done)
     finally:
         if owns_client:
             await finder.__aexit__(None, None, None)

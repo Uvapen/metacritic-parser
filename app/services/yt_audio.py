@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 WHISPER_MAX_BYTES = 25 * 1024 * 1024
 WHISPER_CONVERT_MIN_BYTES = 8 * 1024
-PLAYER_CLIENTS = ("tv_embedded", "web", "android")
+PLAYER_CLIENTS = ("android_vr", "tv_embedded", "web", "android")
 _BOT_MARKERS = (
     "sign in to confirm",
     "not a bot",

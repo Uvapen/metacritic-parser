@@ -36,7 +36,7 @@ from app.services.pipeline import (
     run_youtube_now,
 )
 from app.services.similar import similar_payload
-from app.services.youtube import letsplay_has_summary
+from app.services.youtube import letsplay_has_summary, letsplay_has_video
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(get_settings().templates_dir))
@@ -72,6 +72,7 @@ LLM_KIND_RU = {
 }
 LLM_KIND_FILTERS = frozenset(LLM_KIND_RU)
 LLM_KIND_ORDER = ("critic", "user", "tags", "similar", "youtube", "whisper")
+LLM_NOTE_MODELS = frozenset({"youtube", "heuristic"})
 
 
 def _configured_llm_models() -> list[str]:
@@ -96,6 +97,7 @@ def youtube_id(url: str | None) -> str | None:
 
 templates.env.filters["youtube_id"] = youtube_id
 templates.env.tests["letsplay_ready"] = letsplay_has_summary
+templates.env.tests["letsplay_video"] = letsplay_has_video
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 
@@ -150,6 +152,14 @@ def action_ru(value: str | None) -> str:
     if not value:
         return "—"
     return ACTION_RU.get(value, value)
+
+
+def llm_row_status(item: Any) -> str:
+    if isinstance(item, dict) and (item.get("note") or _is_llm_note(item)):
+        return "заметка"
+    if isinstance(item, dict) and item.get("ok"):
+        return "успех"
+    return "ошибка"
 
 
 def status_ru(value: str | None, run_id: Any = None) -> str:
@@ -341,7 +351,7 @@ def _llm_ok_by_id_for_run(run_id: int, runs: list[Any] | None = None) -> dict[in
             continue
         if _bind_llm_run_id(_coerce_int(item.get("run_id")), _llm_game_slug(item), item.get("ts"), runs) != run_id:
             continue
-        mapping[line_no] = bool(item.get("ok"))
+        mapping[line_no] = True if _is_llm_note(item) else bool(item.get("ok"))
     return mapping
 
 
@@ -364,7 +374,7 @@ def _llm_entries_by_slug_for_run(run_id: int, runs: list[Any] | None = None) -> 
             {
                 "id": line_no,
                 "kind": str(item.get("kind") or ""),
-                "ok": bool(item.get("ok")),
+                "ok": True if _is_llm_note(item) else bool(item.get("ok")),
             }
         )
     return mapping
@@ -375,6 +385,11 @@ def _llm_ids_by_slug_for_run(run_id: int) -> dict[str, list[int]]:
         slug: [int(entry["id"]) for entry in entries]
         for slug, entries in _llm_entries_by_slug_for_run(run_id).items()
     }
+
+
+def _is_llm_note(item: dict[str, Any]) -> bool:
+    """Заметка без HTTP Groq: поиск YouTube или похожие-эвристика."""
+    return str(item.get("model") or "") in LLM_NOTE_MODELS
 
 
 def _llm_jsonl_stats_for_run(run_id: int, runs: list[Any] | None = None) -> tuple[int, int, int]:
@@ -389,6 +404,8 @@ def _llm_jsonl_stats_for_run(run_id: int, runs: list[Any] | None = None) -> tupl
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if _is_llm_note(item):
             continue
         if _bind_llm_run_id(_coerce_int(item.get("run_id")), _llm_game_slug(item), item.get("ts"), runs) != run_id:
             continue
@@ -501,6 +518,7 @@ templates.env.filters["action_counts"] = _action_counts
 templates.env.filters["localtime"] = format_localtime
 templates.env.filters["action_ru"] = action_ru
 templates.env.filters["status_ru"] = status_ru
+templates.env.filters["llm_row_status"] = llm_row_status
 templates.env.filters["change_line"] = format_change_line
 templates.env.filters["change_summary"] = change_summary
 templates.env.filters["llm_lines"] = llm_lines
@@ -533,11 +551,11 @@ def game_to_dict(game: Game, *, detailed: bool = False) -> dict[str, Any]:
         "genres": game.genres,
         "video_url": game.video_url,
         "video_title": game.video_title,
-        "youtube_url": game.youtube_url if letsplay_has_summary(game) else None,
-        "youtube_title": game.youtube_title if letsplay_has_summary(game) else None,
+        "youtube_url": game.youtube_url if letsplay_has_video(game) else None,
+        "youtube_title": game.youtube_title if letsplay_has_video(game) else None,
         "youtube_summary": game.youtube_summary if letsplay_has_summary(game) else None,
         "youtube_summary_source": getattr(game, "youtube_summary_source", None)
-        if letsplay_has_summary(game)
+        if letsplay_has_summary(game) or letsplay_has_video(game)
         else None,
         "youtube_channel": getattr(game, "youtube_channel", None),
         "youtube_views": getattr(game, "youtube_views", None),
@@ -759,7 +777,8 @@ def _collect_llm_records(
         model_name = item.get("model") or ""
         if model_name:
             models.add(str(model_name))
-        is_ok = bool(item.get("ok"))
+        is_note = _is_llm_note(item)
+        is_ok = True if is_note else bool(item.get("ok"))
         attempt = _coerce_int(item.get("attempt")) or 1
         rec_kind = str(item.get("kind") or "")
         if rec_kind:
@@ -793,14 +812,19 @@ def _collect_llm_records(
                 "ts": item.get("ts"),
                 "model": model_name,
                 "ok": is_ok,
-                "stub": item.get("stub"),
+                "stub": item.get("stub") or is_note,
+                "note": is_note,
                 "latency_ms": item.get("latency_ms"),
                 "game_slug": slug,
                 "run_id": rec_run_id,
                 "attempt": attempt,
                 "kind": rec_kind,
                 "origin_id": origin_id,
-                "error": _short_error(humanize_llm_error(raw_error, status_int, compact=True)),
+                "error": (
+                    str(raw_error or item.get("response") or "").strip()
+                    if is_note
+                    else _short_error(humanize_llm_error(raw_error, status_int, compact=True))
+                ),
             }
         )
     records.reverse()
@@ -914,12 +938,14 @@ def _read_llm_record(log_id: int, runs: list[Any] | None = None) -> dict[str, An
                 status_int = int(status) if status is not None else None
             except (TypeError, ValueError):
                 status_int = None
+            is_note = _is_llm_note(item)
             return {
                 "id": log_id,
                 "ts": item.get("ts"),
                 "model": item.get("model"),
-                "ok": bool(item.get("ok")),
-                "stub": item.get("stub"),
+                "ok": True if is_note else bool(item.get("ok")),
+                "stub": item.get("stub") or is_note,
+                "note": is_note,
                 "latency_ms": item.get("latency_ms"),
                 "slug": slug,
                 "game_slug": slug,
@@ -930,8 +956,8 @@ def _read_llm_record(log_id: int, runs: list[Any] | None = None) -> dict[str, An
                 "origin_href": _llm_table_href(origin_id, rec_run_id) if origin_id else "",
                 "system": item.get("system") or "",
                 "prompt": item.get("prompt") or "",
-                "response": item.get("response") or "",
-                "error": humanize_llm_error(item.get("error"), status_int),
+                "response": item.get("response") or (item.get("error") if is_note else "") or "",
+                "error": "" if is_note else humanize_llm_error(item.get("error"), status_int),
                 "error_status": status_int,
             }
     return None
