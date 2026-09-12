@@ -152,12 +152,15 @@
         </div>
       </article>
       <article class="media-card">
-        {% set yt_id = game.youtube_url|youtube_id %}
-        {% if game is letsplay_video and yt_id %}
+        {% set demo = letsplay_demo|default(none) %}
+        {% set yt_id = demo.youtube_id if demo else game.youtube_url|youtube_id %}
+        {% if (demo or game is letsplay_video) and yt_id %}
           <button type="button" class="media-thumb" data-media-src="https://www.youtube.com/embed/{{ yt_id }}" aria-label="Смотреть летсплей">
             <img src="https://i.ytimg.com/vi/{{ yt_id }}/hqdefault.jpg" alt="">
             <span class="play">▶</span>
           </button>
+        {% elif game is letsplay_antibot %}
+          <div class="media-placeholder">Ролик найден, но Render не пускает скачать субтитры и аудио</div>
         {% elif game.youtube_summary_source == "none" %}
           <div class="media-placeholder">Подходящий летсплей не найден</div>
         {% elif awaiting_youtube %}
@@ -167,7 +170,22 @@
         {% endif %}
         <div class="body">
           <strong>Летсплей</strong>
-          {% if game is letsplay_video %}
+          {% if demo %}
+            <p>
+              <span class="pill demo">пример · {{ demo.source_label }}</span>
+            </p>
+            <p class="muted media-caption">
+              {{ demo.youtube_title }}
+              {% if demo.youtube_channel %} · {{ demo.youtube_channel }}{% endif %}
+              {% if demo.youtube_duration_sec %} · {{ demo.youtube_duration_sec|yt_duration }}{% endif %}
+              {% if demo.youtube_views %} · {{ demo.youtube_views|yt_views }} просмотров{% endif %}
+            </p>
+            <p>{{ demo.youtube_summary }}</p>
+            <p class="muted">Снято с домашнего IP. На Render YouTube ставит антибот датацентра — Whisper и саммари при этом работают.</p>
+            {% if demo.youtube_url %}
+              <p><a href="{{ demo.youtube_url }}" target="_blank" rel="noreferrer">Смотреть на YouTube</a></p>
+            {% endif %}
+          {% elif game is letsplay_video %}
             <p class="muted media-caption">
               {{ game.youtube_title or "YouTube" }}
               {% if game.youtube_channel %} · {{ game.youtube_channel }}{% endif %}
@@ -176,12 +194,18 @@
             </p>
             {% if game is letsplay_ready and game.youtube_summary %}
               <p>{{ game.youtube_summary }}</p>
+            {% elif game is letsplay_antibot %}
+              <p class="muted">{{ ANTIBOT_RENDER_MESSAGE }}</p>
+              <p><a href="/examples">Примеры Valheim и Elden Ring</a></p>
             {% else %}
               <p class="muted">саммари появится, когда Groq догонит</p>
             {% endif %}
             {% if game.youtube_url %}
               <p><a href="{{ game.youtube_url }}" target="_blank" rel="noreferrer">Смотреть на YouTube</a></p>
             {% endif %}
+          {% elif game is letsplay_antibot %}
+            <p class="muted media-caption">{{ ANTIBOT_RENDER_MESSAGE }}</p>
+            <p><a href="/examples">Примеры Valheim и Elden Ring</a></p>
           {% elif game.youtube_summary_source == "none" %}
             <p class="muted media-caption">{{ game.youtube_summary or "Подходящий летсплей не найден." }}</p>
           {% elif awaiting_youtube %}
@@ -193,13 +217,6 @@
       </article>
     </div>
   </section>
-
-  <dialog id="media-modal" class="media-modal">
-    <button type="button" class="media-modal-close" data-media-close aria-label="Закрыть">×</button>
-    <div class="media-modal-frame">
-      <iframe id="media-modal-frame" allow="autoplay; fullscreen" allowfullscreen title="Видео"></iframe>
-    </div>
-  </dialog>
 
   <section class="panel">
     <h2>Критики</h2>
@@ -350,20 +367,6 @@
         button.textContent = expanded ? "развернуть" : "свернуть";
       });
     });
-    const modal = document.getElementById("media-modal");
-    const frame = document.getElementById("media-modal-frame");
-    document.querySelectorAll("[data-media-src]").forEach((button) => {
-      button.addEventListener("click", () => {
-        frame.src = button.dataset.mediaSrc;
-        modal.showModal();
-      });
-    });
-    const closeModal = () => {
-      modal.close();
-      frame.removeAttribute("src");
-    };
-    document.querySelector("[data-media-close]").addEventListener("click", closeModal);
-    modal.addEventListener("close", () => frame.removeAttribute("src"));
     {% if awaiting_enrichment %}
     setTimeout(() => location.reload(), 8000);
     {% endif %}

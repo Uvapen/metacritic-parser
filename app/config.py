@@ -66,6 +66,21 @@ class Settings(BaseSettings):
     youtube_call_interval: float = 1.5
     youtube_backfill_limit: int = 40
     youtube_sweep_limit: int = 10
+    youtube_proxy: str = Field(
+        default="",
+        validation_alias=AliasChoices("YOUTUBE_PROXY"),
+        description="HTTPS-прокси для yt-dlp/Innertube. Пусто — прямой выход Render.",
+    )
+    youtube_cookies_path: str = Field(
+        default="",
+        validation_alias=AliasChoices("YOUTUBE_COOKIES_PATH"),
+        description="Путь к Netscape cookies.txt на диске.",
+    )
+    youtube_cookies: str = Field(
+        default="",
+        validation_alias=AliasChoices("YOUTUBE_COOKIES", "YOUTUBE_COOKIES_B64"),
+        description="Содержимое cookies.txt или base64:... Секрет Render, не в git.",
+    )
     whisper_enabled: bool = True
     whisper_model: str = Field(
         default="whisper-large-v3-turbo",

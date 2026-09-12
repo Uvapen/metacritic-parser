@@ -163,6 +163,8 @@
     .pill.success, .pill.new, .pill.updated { background: #123d2c; color: var(--accent); }
     .pill.partial { background: #3d3412; color: var(--mixed); }
     .pill.error { background: #3d151b; color: var(--bad); }
+    .pill.antibot { background: #3d151b; color: var(--bad); }
+    .pill.demo { background: #123d2c; color: var(--accent); }
     .pill.running, .pill.enriching { background: #3d3412; color: var(--mixed); }
     .pill.retry { background: #3d3412; color: var(--mixed); }
     .pill.skipped { background: #2a3140; color: var(--muted); }
@@ -504,6 +506,7 @@
     <a class="brand" href="/">Metacritic <span>Parser</span></a>
     <nav>
       <a href="/" {% if request.url.path == '/' %}class="active"{% endif %}>Последние</a>
+      <a href="/examples" {% if request.url.path == '/examples' %}class="active"{% endif %}>Примеры</a>
       <a href="/games" {% if request.url.path == '/games' %}class="active"{% endif %}>Все игры</a>
       <a href="/monitor" {% if request.url.path == '/monitor' %}class="active"{% endif %}>Монитор</a>
       <a href="/api/docs">API</a>
@@ -512,6 +515,12 @@
   <main>
     {% block content %}{% endblock %}
   </main>
+  <dialog id="media-modal" class="media-modal">
+    <button type="button" class="media-modal-close" data-media-close aria-label="Закрыть">×</button>
+    <div class="media-modal-frame">
+      <iframe id="media-modal-frame" allow="autoplay; fullscreen" allowfullscreen title="Видео"></iframe>
+    </div>
+  </dialog>
   <script>
     (function () {
       const KEY = "scroll_restore";
@@ -560,6 +569,23 @@
           sessionStorage.setItem(KEY, String(window.scrollY));
         }
       });
+
+      const modal = document.getElementById("media-modal");
+      const frame = document.getElementById("media-modal-frame");
+      if (modal && frame) {
+        document.querySelectorAll("[data-media-src]").forEach((button) => {
+          button.addEventListener("click", () => {
+            frame.src = button.dataset.mediaSrc;
+            modal.showModal();
+          });
+        });
+        const closeModal = () => {
+          modal.close();
+          frame.removeAttribute("src");
+        };
+        document.querySelector("[data-media-close]")?.addEventListener("click", closeModal);
+        modal.addEventListener("close", () => frame.removeAttribute("src"));
+      }
 
       const submitFilter = (form) => {
         sessionStorage.setItem(KEY, String(window.scrollY));

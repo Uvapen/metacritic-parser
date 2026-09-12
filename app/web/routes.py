@@ -35,8 +35,10 @@ from app.services.pipeline import (
     run_similar_now,
     run_youtube_now,
 )
+from app.services.letsplay_demo import LETS_PLAY_EXAMPLES, demo_for_slug
 from app.services.similar import similar_payload
-from app.services.youtube import letsplay_has_summary, letsplay_has_video
+from app.services.youtube import letsplay_has_summary, letsplay_has_video, letsplay_is_antibot
+from app.services.yt_audio import ANTIBOT_RENDER_MESSAGE, is_antibot_error
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(get_settings().templates_dir))
@@ -98,6 +100,8 @@ def youtube_id(url: str | None) -> str | None:
 templates.env.filters["youtube_id"] = youtube_id
 templates.env.tests["letsplay_ready"] = letsplay_has_summary
 templates.env.tests["letsplay_video"] = letsplay_has_video
+templates.env.tests["letsplay_antibot"] = letsplay_is_antibot
+templates.env.globals["ANTIBOT_RENDER_MESSAGE"] = ANTIBOT_RENDER_MESSAGE
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 
@@ -155,7 +159,11 @@ def action_ru(value: str | None) -> str:
 
 
 def llm_row_status(item: Any) -> str:
-    if not isinstance(item, dict) or not item.get("ok"):
+    if not isinstance(item, dict):
+        return "ошибка"
+    if is_antibot_error(item.get("error")):
+        return "антибот"
+    if not item.get("ok"):
         return "ошибка"
     if item.get("note") or _is_llm_note(item):
         return "заметка"
@@ -565,9 +573,13 @@ def game_to_dict(game: Game, *, detailed: bool = False) -> dict[str, Any]:
         "youtube_url": game.youtube_url if letsplay_has_video(game) else None,
         "youtube_title": game.youtube_title if letsplay_has_video(game) else None,
         "youtube_summary": game.youtube_summary if letsplay_has_summary(game) else None,
-        "youtube_summary_source": getattr(game, "youtube_summary_source", None)
-        if letsplay_has_summary(game) or letsplay_has_video(game)
-        else None,
+        "youtube_summary_source": (
+            getattr(game, "youtube_summary_source", None)
+            if letsplay_has_summary(game)
+            or letsplay_has_video(game)
+            or letsplay_is_antibot(game)
+            else None
+        ),
         "youtube_channel": getattr(game, "youtube_channel", None),
         "youtube_views": getattr(game, "youtube_views", None),
         "youtube_duration_sec": getattr(game, "youtube_duration_sec", None),
@@ -986,6 +998,24 @@ async def index(request: Request, db: DbSession) -> HTMLResponse:
     return templates.TemplateResponse(request, "index.html", {"games": games})
 
 
+async def _letsplay_examples_payload(db: AsyncSession) -> list[dict[str, Any]]:
+    example_slugs = [item["slug"] for item in LETS_PLAY_EXAMPLES]
+    present: set[str] = set()
+    if example_slugs:
+        found = await db.execute(select(Game.slug).where(Game.slug.in_(example_slugs)))
+        present = set(found.scalars().all())
+    return [{**item, "in_catalog": item["slug"] in present} for item in LETS_PLAY_EXAMPLES]
+
+
+@router.get("/examples", response_class=HTMLResponse)
+async def examples_page(request: Request, db: DbSession) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        "examples.html",
+        {"letsplay_examples": await _letsplay_examples_payload(db)},
+    )
+
+
 @router.get("/games", response_class=HTMLResponse)
 async def games_page(
     request: Request,
@@ -1096,6 +1126,7 @@ async def game_page(slug: str, request: Request, db: DbSession) -> HTMLResponse:
             "awaiting_similar": awaiting_similar,
             "awaiting_youtube": awaiting_youtube,
             "awaiting_enrichment": awaiting_similar or awaiting_youtube,
+            "letsplay_demo": None if letsplay_has_summary(game) else demo_for_slug(slug),
         },
     )
 

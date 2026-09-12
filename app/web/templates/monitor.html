@@ -258,7 +258,10 @@
                 {% endif %}
               </td>
               <td>{{ item.model }}{% if item.stub %} <span class="pill">stub</span>{% endif %}</td>
-              <td>{{ item|llm_row_status }}</td>
+              <td>
+                {% set st = item|llm_row_status %}
+                {% if st == "антибот" %}<span class="pill antibot">антибот</span>{% else %}{{ st }}{% endif %}
+              </td>
               <td>
                 {% if item.origin_id %}
                   <a href="{{ item.origin_href }}">retry id-{{ item.origin_id }}</a>

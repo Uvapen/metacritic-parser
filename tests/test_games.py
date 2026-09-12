@@ -49,6 +49,17 @@ def test_youtube_search_notes_are_not_llm_errors(tmp_path, monkeypatch):
         )
         == "ошибка"
     )
+    assert (
+        llm_row_status(
+            {
+                "model": "youtube",
+                "ok": False,
+                "note": True,
+                "error": "Антибот YouTube: Render (датацентр) не пускает",
+            }
+        )
+        == "антибот"
+    )
     calls, _retries, fails = web_routes._llm_jsonl_stats_for_run(3)
     assert calls == 1
     assert fails == 1

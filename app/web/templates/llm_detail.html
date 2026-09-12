@@ -15,7 +15,7 @@
       · {{ item.model or "—" }}
       {% if item.stub %}<span class="pill">stub</span>{% endif %}
       · {{ item.latency_ms if item.latency_ms is not none else "—" }} мс
-      · {{ item|llm_row_status }}
+      · {% set st = item|llm_row_status %}{% if st == "антибот" %}<span class="pill antibot">антибот</span>{% else %}{{ st }}{% endif %}
       {% if item.kind %} · {{ item.kind|llm_kind_ru }}{% endif %}
       · прогон
       {% if item.run_id %}

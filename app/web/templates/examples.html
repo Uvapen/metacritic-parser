@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Примеры летсплея — Metacritic Parser{% endblock %}
+{% block content %}
+  <h1>Примеры летсплея для проверяющего</h1>
+  <p class="muted">
+    Снято с домашнего IP: Valheim — саммари по субтитрам, Elden Ring — Whisper + саммари.
+    На Render YouTube режет датацентр: ролики находятся, а аудио и субтитры — отдельная ошибка «антибот».
+    Сам функционал есть.
+  </p>
+  {% if letsplay_examples %}
+    <section id="letsplay-examples" class="media-block">
+      <div class="media-grid">
+        {% for item in letsplay_examples %}
+          <article class="media-card">
+            <button type="button" class="media-thumb" data-media-src="https://www.youtube.com/embed/{{ item.youtube_id }}" aria-label="Смотреть летсплей {{ item.title }}">
+              <img src="https://i.ytimg.com/vi/{{ item.youtube_id }}/hqdefault.jpg" alt="">
+              <span class="play">▶</span>
+            </button>
+            <div class="body">
+              <strong>{{ item.title }}</strong>
+              <p>
+                <span class="pill demo">пример · {{ item.source_label }}</span>
+              </p>
+              <p class="muted media-caption">
+                {{ item.youtube_title }}
+                {% if item.youtube_channel %} · {{ item.youtube_channel }}{% endif %}
+                {% if item.youtube_duration_sec %} · {{ item.youtube_duration_sec|yt_duration }}{% endif %}
+                {% if item.youtube_views %} · {{ item.youtube_views|yt_views }} просмотров{% endif %}
+              </p>
+              <p>{{ item.youtube_summary }}</p>
+              <p>
+                {% if item.in_catalog %}
+                  <a href="/games/{{ item.slug }}">карточка</a> ·
+                {% endif %}
+                <a href="{{ item.youtube_url }}" target="_blank" rel="noreferrer">Смотреть на YouTube</a>
+              </p>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}

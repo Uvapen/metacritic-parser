@@ -1,21 +1,28 @@
-"""Аудио летсплея через yt-dlp: короткие окна под лимит Groq Whisper 25 МБ."""
+"""Аудио летсплея через yt-dlp: любое скачанное окно сжимаем под лимит Groq Whisper 25 МБ."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 WHISPER_MAX_BYTES = 25 * 1024 * 1024
 WHISPER_CONVERT_MIN_BYTES = 8 * 1024
+WHISPER_WAV_BYTES_PER_SEC = 16000 * 2
+WHISPER_MAX_SECONDS = max(30, int(WHISPER_MAX_BYTES / WHISPER_WAV_BYTES_PER_SEC * 0.95))
 PLAYER_CLIENTS = ("android", "android_vr", "ios", "mweb", "tv_embedded", "web")
 _AUDIO_FORMAT = (
     "bestaudio[vcodec=none]/bestaudio[ext=m4a]/bestaudio[ext=webm]"
@@ -25,8 +32,64 @@ _BOT_MARKERS = (
     "sign in to confirm",
     "not a bot",
     "confirm you're not a bot",
+    "confirm you are a bot",
     "use --cookies",
+    "please sign in",
+    "bot check",
+    "captcha",
 )
+_CAUSE_WEIGHT = {
+    "ok": 0,
+    "empty": 1,
+    "unknown": 2,
+    "format": 3,
+    "oversized": 4,
+    "unavailable": 5,
+    "js": 6,
+    "timeout": 7,
+    "http": 8,
+    "token": 9,
+    "bot": 10,
+}
+ANTIBOT_RENDER_MESSAGE = (
+    "Антибот YouTube: Render (датацентр) не пускает скачивать аудио и субтитры. "
+    "Функционал Whisper и саммари по ролику есть — с домашнего IP. "
+    "Примеры для проверяющего: вкладка «Примеры» — Valheim и Elden Ring."
+)
+_RENDER_BLOCK_CAUSES = frozenset({"bot", "http", "token"})
+_HOSTILE_CAUSES = frozenset({"bot", "http", "token", "timeout"})
+
+
+@dataclass
+class YtMediaResult:
+    """Файлы yt-dlp плюс причина, если скачать не вышло."""
+
+    files: list[Path] = field(default_factory=list)
+    cause: str = "ok"
+    error: str | None = None
+
+    @property
+    def path(self) -> Path | None:
+        return self.files[0] if self.files else None
+
+    @property
+    def blocked(self) -> bool:
+        return self.cause in _HOSTILE_CAUSES
+
+
+def as_media_result(raw: Any) -> YtMediaResult:
+    if isinstance(raw, YtMediaResult):
+        return raw
+    if isinstance(raw, Path):
+        return YtMediaResult(files=[raw])
+    if isinstance(raw, list):
+        paths = [item for item in raw if isinstance(item, Path)]
+        if paths:
+            return YtMediaResult(files=paths)
+        return YtMediaResult(cause="empty", error="yt-dlp не скачал аудио")
+    return YtMediaResult(cause="empty", error="yt-dlp не скачал аудио")
+
+
 _SKIP_SUFFIXES = {".part", ".ytdl", ".tmp", ".temp"}
 _AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".opus", ".wav", ".webm"}
 _CREATE_NO_WINDOW = 0x08000000
@@ -56,8 +119,171 @@ def audio_windows(duration_sec: int | None, *, compact: bool | None = None) -> l
 
 
 def youtube_download_blocked(stderr: str) -> bool:
-    text = (stderr or "").lower()
-    return any(marker in text for marker in _BOT_MARKERS)
+    return classify_ytdlp_error(stderr)[0] == "bot"
+
+
+def classify_ytdlp_error(stderr: str, *, code: int | None = None) -> tuple[str, str]:
+    """Причина сбоя yt-dlp: bot / timeout / http / format / token / … и текст для журнала."""
+    raw = stderr or ""
+    text = raw.lower().replace("’", "'").replace("`", "'")
+    if code == 124 or "yt-dlp timeout" in text:
+        return "timeout", "таймаут yt-dlp"
+    if any(marker in text for marker in _BOT_MARKERS):
+        return "bot", ANTIBOT_RENDER_MESSAGE
+    if "po token" in text or "potoken" in text:
+        return "token", ANTIBOT_RENDER_MESSAGE
+    if "http error 429" in text or "too many requests" in text:
+        return "http", "YouTube HTTP 429"
+    if "http error 403" in text or "403: forbidden" in text or "http error 401" in text:
+        return "http", ANTIBOT_RENDER_MESSAGE
+    if "requested format is not available" in text:
+        return "format", "yt-dlp: нужный формат аудио недоступен"
+    if "this video is unavailable" in text or "video unavailable" in text:
+        return "unavailable", "ролик недоступен"
+    if "no subtitle" in text or "no automatic caption" in text or "subtitles are not available" in text:
+        return "empty", "у ролика нет субтитров"
+    if "nsig" in text or ("signature" in text and "fail" in text):
+        return "js", "yt-dlp не расшифровал подпись (JS challenge)"
+    snippet = " ".join(raw.split())
+    if snippet:
+        return "unknown", f"yt-dlp не скачал: {snippet[-180:]}"
+    return "empty", "yt-dlp не скачал файл"
+
+
+def is_antibot_error(message: str | None) -> bool:
+    text = (message or "").lower()
+    return "антибот youtube" in text or "бот-стена" in text
+
+
+def is_render_block(cause: str | None, message: str | None = None) -> bool:
+    if cause in _RENDER_BLOCK_CAUSES:
+        return True
+    return is_antibot_error(message)
+
+
+def _decode_cookie_blob(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("base64:"):
+        text = text[7:].strip()
+        return base64.b64decode(text).decode("utf-8")
+    looks_netscape = text.lstrip().startswith("# Netscape") or "\t" in text[:800]
+    if looks_netscape:
+        return raw
+    try:
+        decoded = base64.b64decode(text, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return raw
+    if decoded.lstrip().startswith("# Netscape") or "\t" in decoded[:800] or "youtube" in decoded.lower():
+        return decoded
+    return raw
+
+
+def youtube_cookies_file() -> Path | None:
+    """Netscape cookies.txt: путь на диске или секрет из env. Не логировать содержимое."""
+    settings = get_settings()
+    path = (getattr(settings, "youtube_cookies_path", "") or "").strip()
+    if path:
+        candidate = Path(path)
+        return candidate if candidate.is_file() else None
+    raw = (getattr(settings, "youtube_cookies", "") or "").strip()
+    if not raw:
+        return None
+    dest = settings.data_dir / "tmp" / "youtube_cookies.txt"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(_decode_cookie_blob(raw), encoding="utf-8")
+    return dest
+
+
+def youtube_cookie_dict() -> dict[str, str] | None:
+    path = youtube_cookies_file()
+    if path is None:
+        return None
+    cookies: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw:
+                continue
+            if raw.startswith("#HttpOnly_"):
+                raw = raw[len("#HttpOnly_") :]
+            elif raw.startswith("#"):
+                continue
+            parts = raw.split("\t")
+            if len(parts) < 7:
+                continue
+            domain, name, value = parts[0], parts[5], parts[6]
+            if name and ("youtube" in domain or "google" in domain):
+                cookies[name] = value
+    except OSError:
+        return None
+    return cookies or None
+
+
+def _ytdlp_network_args() -> list[str]:
+    """Прокси и cookies — реальный обход датацентра YouTube, не player_client."""
+    args: list[str] = ["--geo-bypass"]
+    settings = get_settings()
+    proxy = (getattr(settings, "youtube_proxy", "") or "").strip()
+    if proxy:
+        args.extend(["--proxy", proxy])
+    cookies = youtube_cookies_file()
+    if cookies is not None:
+        args.extend(["--cookies", str(cookies)])
+    return args
+
+
+def _prefer_cause(current: str, current_error: str | None, cause: str, error: str | None) -> tuple[str, str | None]:
+    if _CAUSE_WEIGHT.get(cause, 0) >= _CAUSE_WEIGHT.get(current, 0):
+        return cause, error or current_error
+    return current, current_error
+
+
+def fit_whisper_audio(src: Path, *, timeout: float = 90.0) -> Path | None:
+    """Любой контейнер → WAV 16 kHz mono под 25 МБ (обрезаем длительность, если надо)."""
+    if not src.is_file() or src.stat().st_size <= 0:
+        return None
+    size = src.stat().st_size
+    if size < WHISPER_CONVERT_MIN_BYTES:
+        return src if size <= WHISPER_MAX_BYTES else None
+    ffmpeg = ffmpeg_path()
+    if not ffmpeg:
+        if size <= WHISPER_MAX_BYTES:
+            return src
+        logger.warning("Аудио %s больше 25 МБ (%s) и нет ffmpeg", src.name, size)
+        return None
+    ready = prepare_whisper_audio(src, timeout=timeout)
+    if ready.is_file() and 0 < ready.stat().st_size <= WHISPER_MAX_BYTES:
+        return ready
+    dest = src.with_name(f"{src.stem}_groq25.wav")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-t",
+        str(WHISPER_MAX_SECONDS),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(dest),
+    ]
+    code, stderr = _run_ytdlp_sync(cmd, timeout)
+    if code == 0 and dest.is_file() and 0 < dest.stat().st_size <= WHISPER_MAX_BYTES:
+        return dest
+    if size <= WHISPER_MAX_BYTES:
+        return src
+    logger.warning("Аудио %s больше 25 МБ (%s), пропуск", src.name, size)
+    if stderr:
+        logger.warning("ffmpeg trim %s: %s %s", src.name, code, stderr[-200:])
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -113,52 +339,20 @@ def prepare_whisper_audio(src: Path, *, timeout: float = 60.0) -> Path:
     return src
 
 
-def fit_whisper_audio(src: Path, *, timeout: float = 90.0) -> Path | None:
-    """Уложить файл в лимит Groq 25 МБ: WAV 16 kHz, при необходимости первые 10 минут."""
-    if not src.is_file() or src.stat().st_size <= 0:
-        return None
-    if src.stat().st_size <= WHISPER_MAX_BYTES:
-        return src
-    ready = prepare_whisper_audio(src, timeout=timeout)
-    if ready.is_file() and 0 < ready.stat().st_size <= WHISPER_MAX_BYTES:
-        return ready
-    ffmpeg = ffmpeg_path()
-    if not ffmpeg:
-        logger.warning("Аудио %s больше 25 МБ (%s), пропуск", src.name, src.stat().st_size)
-        return None
-    dest = src.with_name(f"{src.stem}_groq10.wav")
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(src),
-        "-t",
-        "600",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-c:a",
-        "pcm_s16le",
-        str(dest),
-    ]
-    code, stderr = _run_ytdlp_sync(cmd, timeout)
-    if code == 0 and dest.is_file() and 0 < dest.stat().st_size <= WHISPER_MAX_BYTES:
-        return dest
-    logger.warning("Аудио %s больше 25 МБ (%s), пропуск", src.name, src.stat().st_size)
-    if stderr:
-        logger.warning("ffmpeg trim %s: %s %s", src.name, code, stderr[-200:])
-    return None
-
-
 def _js_runtime_args() -> list[str]:
     node = shutil.which("node")
     if node:
         return ["--js-runtimes", f"node:{node}"]
     return []
+
+
+def _player_extractor_args(player_client: str | None) -> str:
+    if not player_client:
+        return "youtube:"
+    args = f"youtube:player_client={player_client}"
+    if player_client in {"android", "ios"}:
+        args += ",player_skip=webpage"
+    return args
 
 
 def _ytdlp_cmd(
@@ -180,8 +374,9 @@ def _ytdlp_cmd(
         "2",
         "--fragment-retries",
         "2",
+        *(_ytdlp_network_args()),
         "--extractor-args",
-        f"youtube:player_client={player_client}",
+        _player_extractor_args(player_client),
         "-o",
         outtmpl,
     ]
@@ -299,6 +494,7 @@ async def search_youtube_ytdlp(
         "--no-warnings",
         "--no-progress",
         "--skip-download",
+        *(_ytdlp_network_args()),
         "-J",
         f"ytsearch{n}:{q}",
     ]
@@ -327,9 +523,9 @@ def _pick_output(folder: Path, stem: str) -> Path | None:
     if not found:
         return None
     under = [path for path in found if path.stat().st_size <= WHISPER_MAX_BYTES]
-    if under:
-        return max(under, key=lambda item: item.stat().st_size)
-    candidate = min(found, key=lambda item: item.stat().st_size)
+    candidate = max(under, key=lambda item: item.stat().st_size) if under else min(
+        found, key=lambda item: item.stat().st_size
+    )
     return fit_whisper_audio(candidate)
 
 
@@ -375,12 +571,12 @@ def _ytdlp_captions_cmd(url: str, outtmpl: str, player_client: str | None) -> li
         "vtt",
         "--retries",
         "2",
+        *(_ytdlp_network_args()),
         "-o",
         outtmpl,
     ]
     cmd.extend(_js_runtime_args())
-    if player_client:
-        cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
+    cmd.extend(["--extractor-args", _player_extractor_args(player_client)])
     ffmpeg = ffmpeg_path()
     if ffmpeg:
         cmd.extend(["--ffmpeg-location", ffmpeg])
@@ -388,21 +584,26 @@ def _ytdlp_captions_cmd(url: str, outtmpl: str, player_client: str | None) -> li
     return cmd
 
 
-async def download_letsplay_captions(video_id: str, dest_dir: Path, *, timeout: float = 90.0) -> Path | None:
+async def download_letsplay_captions(video_id: str, dest_dir: Path, *, timeout: float = 90.0) -> YtMediaResult:
     """Субтитры через yt-dlp. timedtext без PO-токена часто приходит пустым."""
     video_id = (video_id or "").strip()
     if len(video_id) != 11:
-        return None
+        return YtMediaResult(cause="empty", error="некорректный video_id")
     dest_dir.mkdir(parents=True, exist_ok=True)
     url = f"https://www.youtube.com/watch?v={video_id}"
     outtmpl = str(dest_dir / f"{video_id}.%(ext)s")
+    cause, error = "empty", "yt-dlp не скачал субтитры"
     for client in (*PLAYER_CLIENTS, None):
         code, stderr = await _run_ytdlp(_ytdlp_captions_cmd(url, outtmpl, client), timeout)
         path = _pick_caption(dest_dir, video_id)
         if path is not None:
-            return path
+            return YtMediaResult(files=[path])
+        nxt_cause, nxt_error = classify_ytdlp_error(stderr, code=code)
+        cause, error = _prefer_cause(cause, error, nxt_cause, nxt_error)
         logger.warning("yt-dlp субтитры %s для %s (%s): %s", code, video_id, client, (stderr or "")[-300:])
-    return None
+        if nxt_cause in _HOSTILE_CAUSES:
+            break
+    return YtMediaResult(cause=cause, error=error)
 
 
 async def download_letsplay_audio(
@@ -411,21 +612,21 @@ async def download_letsplay_audio(
     *,
     duration_sec: int | None = None,
     timeout: float = 180.0,
-) -> list[Path]:
-    """Качает 1 или 3 окна аудио. Пустой список — бот-стена или ошибка yt-dlp."""
+) -> YtMediaResult:
+    """Качает 1 или 3 окна аудио и сразу сжимает каждое под 25 МБ."""
     video_id = (video_id or "").strip()
     if len(video_id) != 11:
-        return []
+        return YtMediaResult(cause="empty", error="некорректный video_id")
     dest_dir.mkdir(parents=True, exist_ok=True)
     url = f"https://www.youtube.com/watch?v={video_id}"
     windows = audio_windows(duration_sec)
     if not _has_ffmpeg():
         windows = [None]
     files: list[Path] = []
+    cause, error = "empty", "yt-dlp не скачал аудио"
     for index, section in enumerate(windows):
         outtmpl = str(dest_dir / f"{video_id}_{index}.%(ext)s")
         path = None
-        blocked = False
         for client in PLAYER_CLIENTS:
             for leftover in dest_dir.glob(f"{video_id}_{index}.*"):
                 leftover.unlink(missing_ok=True)
@@ -443,10 +644,8 @@ async def download_letsplay_audio(
                         client,
                     )
                 break
-            if youtube_download_blocked(stderr):
-                blocked = True
-                logger.warning("YouTube бот-стена для %s (%s)", video_id, client)
-                continue
+            nxt_cause, nxt_error = classify_ytdlp_error(stderr, code=code)
+            cause, error = _prefer_cause(cause, error, nxt_cause, nxt_error)
             logger.warning(
                 "yt-dlp %s для %s (%s): %s",
                 code,
@@ -454,9 +653,13 @@ async def download_letsplay_audio(
                 client,
                 (stderr or "")[-400:],
             )
+            if nxt_cause in _HOSTILE_CAUSES:
+                return YtMediaResult(cause=nxt_cause, error=nxt_error)
         if path is None:
-            if blocked:
-                return []
-            continue
+            if files:
+                break
+            return YtMediaResult(cause=cause, error=error)
         files.append(path)
-    return files
+    if files:
+        return YtMediaResult(files=files)
+    return YtMediaResult(cause=cause, error=error)

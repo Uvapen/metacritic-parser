@@ -250,6 +250,17 @@ def test_letsplay_job_needed_until_transcript_or_no_captions():
     assert needs_letsplay_job(old_stub) is True
     assert needs_letsplay_job(new_stub) is False
     assert needs_letsplay_job(new_stub, force=True) is True
+    antibot = SimpleNamespace(
+        youtube_summary=None,
+        youtube_summary_source="antibot",
+    )
+    from unittest.mock import patch
+
+    with patch("app.services.youtube.youtube_egress_configured", return_value=False):
+        assert needs_letsplay_job(antibot) is False
+    with patch("app.services.youtube.youtube_egress_configured", return_value=True):
+        assert needs_letsplay_job(antibot) is True
+    assert needs_letsplay_job(antibot, force=True) is True
     dump = SimpleNamespace(
         youtube_summary="Привет и добро пожаловать обратно на Rage Gaming, и чёрт возьми",
         youtube_summary_source="transcript",
@@ -442,7 +453,7 @@ def test_attach_does_not_stub_when_whisper_fails():
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, patch
 
-    from app.services.youtube import LETS_PLAY_STUB, YoutubeVideo, attach_letsplay
+    from app.services.youtube import LETS_PLAY_STUB, WhisperOutcome, YoutubeVideo, attach_letsplay
 
     game = SimpleNamespace(
         slug="crimson-moon",
@@ -471,7 +482,7 @@ def test_attach_does_not_stub_when_whisper_fails():
     async def _run():
         with patch(
             "app.services.youtube.whisper_letsplay_text",
-            new=AsyncMock(return_value=None),
+            new=AsyncMock(return_value=WhisperOutcome()),
         ):
             return await attach_letsplay(game, client, llm=SimpleNamespace())
 
@@ -487,7 +498,7 @@ def test_attach_keeps_saved_video_when_search_empty():
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, patch
 
-    from app.services.youtube import LETS_PLAY_STUB, attach_letsplay
+    from app.services.youtube import LETS_PLAY_STUB, WhisperOutcome, attach_letsplay
 
     game = SimpleNamespace(
         slug="crimson-moon",
@@ -511,7 +522,7 @@ def test_attach_keeps_saved_video_when_search_empty():
     async def _run():
         with patch(
             "app.services.youtube.whisper_letsplay_text",
-            new=AsyncMock(return_value=None),
+            new=AsyncMock(return_value=WhisperOutcome()),
         ):
             return await attach_letsplay(game, client, llm=SimpleNamespace())
 
@@ -521,7 +532,64 @@ def test_attach_keeps_saved_video_when_search_empty():
     assert game.youtube_url == "https://www.youtube.com/watch?v=abcdefghijk"
 
 
-def test_long_title_match_without_gameplay_word_is_letsplay():
+def test_attach_stops_after_youtube_bot_wall():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from app.services.youtube import WhisperOutcome, YoutubeVideo, attach_letsplay
+
+    game = SimpleNamespace(
+        slug="crimson-moon",
+        title="Crimson Moon",
+        youtube_url=None,
+        youtube_title=None,
+        youtube_channel=None,
+        youtube_views=None,
+        youtube_duration_sec=None,
+        youtube_kind=None,
+        youtube_transcript_sample=None,
+        youtube_summary=None,
+        youtube_summary_source=None,
+    )
+    first = YoutubeVideo(video_id="firstvideo1", title="Crimson Moon Gameplay", duration_sec=600, views=1000)
+    second = YoutubeVideo(video_id="secondvid12", title="Crimson Moon Let's Play", duration_sec=800, views=500)
+    notes: list[dict] = []
+
+    async def note(**kwargs):
+        notes.append(kwargs)
+        return 1
+
+    client = SimpleNamespace(
+        last_search_count=2,
+        last_caption_error="timedtext пустой (часто без PO-токена)",
+        last_caption_cause="token",
+        list_letsplays=AsyncMock(return_value=[first, second]),
+        fetch_transcript=AsyncMock(return_value=None),
+    )
+    whisper = AsyncMock(
+        return_value=WhisperOutcome(
+            error="Whisper не запустился: " + "Антибот YouTube: Render",
+            cause="bot",
+        )
+    )
+
+    async def _run():
+        with patch("app.services.youtube.whisper_letsplay_text", new=whisper):
+            return await attach_letsplay(game, client, llm=SimpleNamespace(note=note))
+
+    changed = asyncio.run(_run())
+    assert changed is True
+    assert whisper.await_count == 1
+    assert game.youtube_summary_source == "antibot"
+    assert game.youtube_url == "https://www.youtube.com/watch?v=firstvideo1"
+    youtube_notes = [item for item in notes if item.get("kind") == "youtube"]
+    assert youtube_notes
+    combined = youtube_notes[-1].get("error") or ""
+    assert "Субтитры:" in combined
+    assert "антибот" in combined.lower()
+    assert "Render" in combined
+    assert "таймаут" not in combined
     from app.services.youtube import YoutubeVideo, classify_youtube_video, choose_letsplay
 
     video = YoutubeVideo(
@@ -573,6 +641,24 @@ def test_parse_ytdlp_search_json_reads_entries():
     assert rows[0]["video_id"] == "abcdefghijk"
     assert rows[0]["views"] == 12345
     assert rows[0]["channel"] == "PlayChan"
+
+
+def test_letsplay_demo_examples():
+    from app.services.letsplay_demo import LETS_PLAY_EXAMPLES, demo_for_slug
+
+    valheim = demo_for_slug("valheim")
+    elden = demo_for_slug("elden-ring-tarnished-edition")
+    assert valheim is not None and elden is not None
+    assert valheim["youtube_id"] == "IAMPr9kytfk"
+    assert elden["youtube_id"] == "081FSXiNL2s"
+    assert valheim["youtube_summary_source"] == "transcript"
+    assert elden["youtube_summary_source"] == "whisper"
+    assert len(valheim["youtube_summary"]) > 80
+    assert len(elden["youtube_summary"]) > 80
+    assert {item["slug"] for item in LETS_PLAY_EXAMPLES} == {
+        "valheim",
+        "elden-ring-tarnished-edition",
+    }
 
 
 

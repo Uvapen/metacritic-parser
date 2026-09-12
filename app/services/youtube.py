@@ -21,10 +21,14 @@ from app.config import Settings, get_settings
 from app.db import SessionLocal
 from app.models import Game
 from app.services.yt_audio import (
+    ANTIBOT_RENDER_MESSAGE,
+    as_media_result,
     download_letsplay_audio,
     download_letsplay_captions,
+    is_render_block,
     prepare_whisper_audio,
     search_youtube_ytdlp,
+    youtube_cookie_dict,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,6 +37,9 @@ INNERTUBE_URL = "https://www.youtube.com/youtubei/v1/search"
 INNERTUBE_PLAYER_URL = "https://www.youtube.com/youtubei/v1/player"
 INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 INNERTUBE_CLIENT_VERSION = "2.20241218.01.00"
+INNERTUBE_ANDROID_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"
+INNERTUBE_ANDROID_VERSION = "19.47.14"
+INNERTUBE_TV_VERSION = "2.0"
 RESULTS_URL = "https://www.youtube.com/results"
 WATCH_URL = "https://www.youtube.com/watch?v={video_id}"
 VIDEO_FILTER = "EgIQAQ%3D%3D"
@@ -99,6 +106,7 @@ _last_call_ts: float | None = None
 _pace_lock: asyncio.Lock | None = None
 LETS_PLAY_PROBE_LIMIT = 3
 LETS_PLAY_READY_SOURCES = frozenset({"transcript", "whisper"})
+LETS_PLAY_ANTIBOT_SOURCE = "antibot"
 LETS_PLAY_STUB = "Подходящий летсплей не найден."
 LETS_PLAY_STUB_CAPTIONS = "Подходящий летсплей с субтитрами не найден."
 _BLURB_MARKERS = re.compile(
@@ -142,6 +150,21 @@ class LetsPlayHit:
     duration_sec: int | None = None
     kind: str = "letsplay"
     transcript_sample: str | None = None
+
+
+@dataclass
+class WhisperOutcome:
+    text: str | None = None
+    error: str | None = None
+    cause: str = "ok"
+
+    @property
+    def blocked(self) -> bool:
+        return self.cause in {"bot", "http", "token", "timeout"}
+
+    @property
+    def render_blocked(self) -> bool:
+        return self.cause in {"bot", "http", "token"}
 
 
 def _pace_lock_get() -> asyncio.Lock:
@@ -420,13 +443,33 @@ class YoutubeClient:
         self._settings = settings or get_settings()
         self._session: AsyncSession | None = None
         self.last_search_count = 0
+        self.last_caption_error: str | None = None
+        self.last_caption_cause: str | None = None
 
     async def __aenter__(self) -> YoutubeClient:
-        self._session = AsyncSession(
-            headers=YOUTUBE_HEADERS,
-            timeout=self._settings.youtube_timeout,
-            impersonate=self._settings.impersonate or "chrome120",
-        )
+        kwargs: dict[str, Any] = {
+            "headers": YOUTUBE_HEADERS,
+            "timeout": self._settings.youtube_timeout,
+            "impersonate": self._settings.impersonate or "chrome120",
+        }
+        proxy = (getattr(self._settings, "youtube_proxy", "") or "").strip()
+        if proxy:
+            kwargs["proxy"] = proxy
+            logger.info("YouTube Innertube: прокси включён")
+        cookies = youtube_cookie_dict()
+        if cookies:
+            kwargs["cookies"] = cookies
+            logger.info("YouTube Innertube: cookies загружены (%s шт.)", len(cookies))
+        try:
+            self._session = AsyncSession(**kwargs)
+        except TypeError:
+            kwargs.pop("proxy", None)
+            kwargs.pop("cookies", None)
+            self._session = AsyncSession(
+                headers=YOUTUBE_HEADERS,
+                timeout=self._settings.youtube_timeout,
+                impersonate=self._settings.impersonate or "chrome120",
+            )
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -619,12 +662,22 @@ class YoutubeClient:
         duration_sec: int | None = None,
     ) -> str | None:
         """Субтитры ролика: watch page / Innertube player → timedtext XML."""
+        self.last_caption_error = None
+        self.last_caption_cause = None
         video_id = (video_id or "").strip()
         if len(video_id) != 11:
+            self.last_caption_cause = "empty"
+            self.last_caption_error = "некорректный video_id"
             return None
         tracks = await self._caption_tracks(video_id)
         track_url = pick_caption_track(tracks)
-        if track_url:
+        if not tracks:
+            self.last_caption_cause = "empty"
+            self.last_caption_error = "у ролика нет дорожки субтитров (watch/player)"
+        elif not track_url:
+            self.last_caption_cause = "empty"
+            self.last_caption_error = "дорожки субтитров без URL"
+        else:
             session = self._require_session()
             await _pace(self._settings.youtube_call_interval)
             try:
@@ -640,9 +693,15 @@ class YoutubeClient:
                         cues = parse_caption_cues(response.text)
                         sampled = sample_transcript(cues, duration_sec=duration_sec)
                         return sampled or text
+                    self.last_caption_cause = "token"
+                    self.last_caption_error = "timedtext пустой (часто без PO-токена)"
                 else:
+                    self.last_caption_cause = "http"
+                    self.last_caption_error = f"timedtext HTTP {response.status_code}"
                     logger.warning("YouTube captions HTTP %s для %s", response.status_code, video_id)
             except Exception as exc:
+                self.last_caption_cause = "unknown"
+                self.last_caption_error = f"timedtext ошибка: {exc}"
                 logger.warning("YouTube captions ошибка %s: %s", video_id, exc)
         return await self._captions_via_ytdlp(video_id, duration_sec=duration_sec)
 
@@ -673,34 +732,41 @@ class YoutubeClient:
 
     async def _caption_tracks_player(self, video_id: str) -> list[dict[str, Any]]:
         session = self._require_session()
-        await _pace(self._settings.youtube_call_interval)
-        payload = {
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": INNERTUBE_CLIENT_VERSION,
-                    "hl": "en",
-                    "gl": "US",
-                }
-            },
-            "videoId": video_id,
-        }
-        try:
-            response = await session.post(
-                INNERTUBE_PLAYER_URL,
-                params={"key": INNERTUBE_KEY, "prettyPrint": "false"},
-                json=payload,
-                headers={**YOUTUBE_HEADERS, "Content-Type": "application/json"},
-                timeout=self._settings.youtube_timeout,
-                impersonate=self._settings.impersonate or "chrome120",
-            )
-            if response.status_code != 200:
-                return []
-            data = response.json()
-        except Exception as exc:
-            logger.warning("YouTube player ошибка %s: %s", video_id, exc)
-            return []
-        return caption_tracks_from_player(data)
+        clients = (
+            ("WEB", INNERTUBE_CLIENT_VERSION, INNERTUBE_KEY, None),
+            ("ANDROID", INNERTUBE_ANDROID_VERSION, INNERTUBE_ANDROID_KEY, None),
+            ("TVHTML5_SIMPLY_EMBEDDED_PLAYER", INNERTUBE_TV_VERSION, INNERTUBE_KEY, "https://www.youtube.com/"),
+        )
+        for name, version, key, embed in clients:
+            await _pace(self._settings.youtube_call_interval)
+            client: dict[str, Any] = {
+                "clientName": name,
+                "clientVersion": version,
+                "hl": "en",
+                "gl": "US",
+            }
+            payload: dict[str, Any] = {"context": {"client": client}, "videoId": video_id}
+            if embed:
+                payload["context"]["thirdParty"] = {"embedUrl": embed}
+            try:
+                response = await session.post(
+                    INNERTUBE_PLAYER_URL,
+                    params={"key": key, "prettyPrint": "false"},
+                    json=payload,
+                    headers={**YOUTUBE_HEADERS, "Content-Type": "application/json"},
+                    timeout=self._settings.youtube_timeout,
+                    impersonate=self._settings.impersonate or "chrome120",
+                )
+                if response.status_code != 200:
+                    logger.warning("YouTube player HTTP %s (%s) для %s", response.status_code, name, video_id)
+                    continue
+                tracks = caption_tracks_from_player(response.json())
+            except Exception as exc:
+                logger.warning("YouTube player ошибка %s (%s): %s", video_id, name, exc)
+                continue
+            if tracks:
+                return tracks
+        return []
 
     async def _captions_via_ytdlp(
         self,
@@ -711,19 +777,32 @@ class YoutubeClient:
         """timedtext часто пустой без PO-токена; yt-dlp android_vr отдаёт VTT."""
         dest = self._settings.data_dir / "tmp" / "captions" / video_id
         try:
-            path = await download_letsplay_captions(video_id, dest)
-            if path is None:
+            media = as_media_result(await download_letsplay_captions(video_id, dest))
+            if media.path is None:
+                if media.error:
+                    self.last_caption_cause = media.cause
+                    self.last_caption_error = f"yt-dlp субтитры: {media.error}"
                 return None
-            raw = path.read_text(encoding="utf-8", errors="replace")
-            suffix = path.suffix.lower()
+            raw = media.path.read_text(encoding="utf-8", errors="replace")
+            suffix = media.path.suffix.lower()
             cues = parse_vtt_cues(raw) if suffix == ".vtt" else parse_caption_cues(raw)
             sampled = sample_transcript(cues, duration_sec=duration_sec)
             text = sampled or parse_caption_xml(raw) or None
             if text:
-                logger.info("yt-dlp субтитры %s: %s символов (%s)", video_id, len(text), path.name)
+                logger.info("yt-dlp субтитры %s: %s символов (%s)", video_id, len(text), media.path.name)
+                self.last_caption_error = None
+                self.last_caption_cause = None
+            elif media.error:
+                self.last_caption_cause = media.cause
+                self.last_caption_error = f"yt-dlp субтитры пустые: {media.error}"
+            else:
+                self.last_caption_cause = "empty"
+                self.last_caption_error = "yt-dlp скачал субтитры, но текст пустой"
             return text
         except Exception:
             logger.exception("yt-dlp субтитры не разобрались для %s", video_id)
+            self.last_caption_cause = "unknown"
+            self.last_caption_error = "yt-dlp субтитры упали с исключением"
             return None
         finally:
             shutil.rmtree(dest, ignore_errors=True)
@@ -950,6 +1029,27 @@ def transcript_is_listing_copy(transcript: str | None, description: str | None =
     return (len(desc_words & body_words) / len(desc_words)) >= 0.7
 
 
+def youtube_egress_configured(settings: Settings | None = None) -> bool:
+    """Прокси или cookies — есть шанс обойти датацентр Render."""
+    cfg = settings or get_settings()
+    if (getattr(cfg, "youtube_proxy", "") or "").strip():
+        return True
+    if (getattr(cfg, "youtube_cookies", "") or "").strip():
+        return True
+    path = (getattr(cfg, "youtube_cookies_path", "") or "").strip()
+    return bool(path)
+
+
+def letsplay_is_antibot(game: Any) -> bool:
+    return getattr(game, "youtube_summary_source", None) == LETS_PLAY_ANTIBOT_SOURCE
+
+
+def apply_letsplay_antibot(game: Game) -> None:
+    """Ролик оставляем, саммари нет: Render/датацентр режет аудио и субтитры."""
+    game.youtube_summary = None
+    game.youtube_summary_source = LETS_PLAY_ANTIBOT_SOURCE
+
+
 def letsplay_has_summary(game: Any) -> bool:
     source = getattr(game, "youtube_summary_source", None)
     summary = " ".join((getattr(game, "youtube_summary", None) or "").split())
@@ -991,6 +1091,8 @@ def needs_letsplay_job(game: Any, *, force: bool = False) -> bool:
         return True
     source = getattr(game, "youtube_summary_source", None)
     summary = " ".join((getattr(game, "youtube_summary", None) or "").split())
+    if source == LETS_PLAY_ANTIBOT_SOURCE:
+        return youtube_egress_configured()
     if source == "none":
         return summary == LETS_PLAY_STUB_CAPTIONS
     return True
@@ -1065,37 +1167,43 @@ async def whisper_letsplay_text(
     duration_sec: int | None,
     llm: Any,
     slug: str | None = None,
-) -> str | None:
+) -> WhisperOutcome:
     """Скачать аудио популярного ролика и расшифровать Groq Whisper."""
     settings = get_settings()
     if not getattr(settings, "whisper_enabled", True):
-        return None
+        return WhisperOutcome(error="Whisper выключен", cause="empty")
     if llm is None or not hasattr(llm, "transcribe"):
-        return None
+        return WhisperOutcome(error="Whisper: нет LLM-клиента", cause="empty")
     dest = settings.data_dir / "tmp" / "whisper" / video_id
     try:
-        paths = await download_letsplay_audio(video_id, dest, duration_sec=duration_sec)
-        if not paths:
-            logger.info("Whisper: нет аудио для %s", video_id)
+        media = as_media_result(
+            await download_letsplay_audio(video_id, dest, duration_sec=duration_sec)
+        )
+        if not media.files:
+            error = f"Whisper не запустился: {media.error or 'yt-dlp не скачал аудио'}"
+            logger.info("Whisper: нет аудио для %s (%s)", video_id, error)
             if hasattr(llm, "note"):
                 try:
                     await llm.note(
                         prompt=f"[whisper {video_id}]",
-                        error="Whisper не запустился: yt-dlp не скачал аудио (бот-стена или таймаут)",
+                        error=error,
                         slug=slug,
                         kind="whisper",
                         model=str(getattr(settings, "whisper_model", None) or "whisper-large-v3-turbo"),
                     )
                 except Exception:
                     logger.exception("Не записали whisper-заметку для %s", video_id)
-            return None
-        logger.info("Whisper: %s → %s", video_id, [path.name for path in paths])
+            return WhisperOutcome(error=error, cause=media.cause)
+        logger.info("Whisper: %s → %s", video_id, [path.name for path in media.files])
         parts: list[str] = []
-        had_error = False
-        for path in paths:
+        api_error: str | None = None
+        for path in media.files:
             if path.suffix.lower() == ".part" or ".part" in path.suffixes:
                 continue
             ready = prepare_whisper_audio(path)
+            if ready.stat().st_size > 25 * 1024 * 1024:
+                api_error = f"аудио {ready.name} всё ещё больше 25 МБ"
+                continue
             result = await llm.transcribe(
                 ready.read_bytes(),
                 filename=ready.name,
@@ -1103,19 +1211,19 @@ async def whisper_letsplay_text(
                 kind="whisper",
             )
             if getattr(result, "error", None):
-                had_error = True
+                api_error = str(result.error)
                 logger.warning("Whisper %s: %s", ready.name, result.error)
             text = " ".join((result.text or "").split())
             if text:
                 parts.append(text)
         if not parts:
-            if had_error:
-                logger.warning("Whisper: нет текста для %s (ошибка API)", video_id)
-            return None
-        return _clip_chars(" … ".join(parts), 25_000)
-    except Exception:
+            error = f"Whisper API: {api_error}" if api_error else "Whisper не вернул текст"
+            logger.warning("Whisper: нет текста для %s (%s)", video_id, error)
+            return WhisperOutcome(error=error, cause="unknown")
+        return WhisperOutcome(text=_clip_chars(" … ".join(parts), 25_000))
+    except Exception as exc:
         logger.exception("Whisper не расшифровал %s", video_id)
-        return None
+        return WhisperOutcome(error=f"Whisper упал: {exc}", cause="unknown")
     finally:
         shutil.rmtree(dest, ignore_errors=True)
 
@@ -1221,7 +1329,7 @@ async def attach_letsplay(
         return False
     if letsplay_has_summary(game):
         return False
-    if getattr(game, "youtube_summary_source", None) == "none":
+    if getattr(game, "youtube_summary_source", None) in {"none", LETS_PLAY_ANTIBOT_SOURCE}:
         game.youtube_summary = None
         game.youtube_summary_source = None
 
@@ -1265,6 +1373,8 @@ async def attach_letsplay(
 
     technical_block = False
     saw_non_speech = False
+    caption_error: str | None = None
+    whisper_error: str | None = None
     for video in videos:
         apply_letsplay(game, _hit_from_video(video))
         await persist_letsplay_progress(game)
@@ -1278,18 +1388,37 @@ async def attach_letsplay(
         except Exception:
             logger.exception("Субтитры не разобрались для %s", video.video_id)
             technical_block = True
+            caption_error = "субтитры упали с исключением"
             text = None
+        else:
+            caption_error = getattr(client, "last_caption_error", None) or caption_error
         if not text:
-            text = await whisper_letsplay_text(
+            spoken = await whisper_letsplay_text(
                 video.video_id,
                 duration_sec=video.duration_sec,
                 llm=llm,
                 slug=game.slug,
             )
-            if text:
+            if spoken.text:
+                text = spoken.text
                 origin = "whisper"
             else:
                 technical_block = True
+                whisper_error = spoken.error or whisper_error
+                if spoken.render_blocked:
+                    apply_letsplay_antibot(game)
+                    parts: list[str] = []
+                    if caption_error:
+                        parts.append(
+                            caption_error
+                            if caption_error.lower().startswith("субтитр")
+                            else f"Субтитры: {caption_error}"
+                        )
+                    parts.append(ANTIBOT_RENDER_MESSAGE)
+                    await _trace(". ".join(parts), failed=True)
+                    return letsplay_has_video(game)
+                if spoken.blocked:
+                    break
                 continue
         status = await conclude_letsplay(
             game,
@@ -1314,7 +1443,24 @@ async def attach_letsplay(
             "Летсплей %s: нет текста из‑за субтитров/Whisper — заглушку не ставим",
             game.slug,
         )
-        await _trace("Ролик найден, но субтитры и Whisper не дали текст", failed=True)
+        parts: list[str] = []
+        if caption_error:
+            parts.append(
+                caption_error
+                if caption_error.lower().startswith("субтитр")
+                else f"Субтитры: {caption_error}"
+            )
+        if whisper_error:
+            parts.append(whisper_error)
+        caption_cause = getattr(client, "last_caption_cause", None)
+        if is_render_block(caption_cause, caption_error) or is_render_block(None, whisper_error):
+            apply_letsplay_antibot(game)
+            if not any(is_render_block(None, item) for item in parts):
+                parts.append(ANTIBOT_RENDER_MESSAGE)
+        await _trace(
+            ". ".join(parts) if parts else "Ролик найден, но субтитры и Whisper не дали текст",
+            failed=True,
+        )
         return letsplay_has_video(game)
     return apply_letsplay_stub(game)
 
